@@ -1,0 +1,164 @@
+//! The serialized result of one inspection.
+//!
+//! Every offset is a byte offset into the input file. Facts read directly from
+//! the file are reported as observations; names, discriminator meanings and
+//! framework identification are inferences and say what corroborates them.
+
+use serde::Serialize;
+
+/// Complete result of inspecting one sBPF ELF file.
+#[derive(Debug, Serialize)]
+pub struct Report {
+    pub engine: Engine,
+    pub artifact: Artifact,
+    pub elf: ElfFacts,
+    pub syscalls: Vec<SyscallUse>,
+    pub constants: ConstantCoverage,
+    pub strings: Vec<StringFact>,
+    pub anchor: AnchorFacts,
+    pub unknowns: Vec<String>,
+    /// Non-fatal problems met while parsing; analysis continued past them.
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Engine {
+    pub name: &'static str,
+    pub version: &'static str,
+    pub upstream: Vec<Upstream>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Upstream {
+    pub name: &'static str,
+    pub version: &'static str,
+    pub license: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Artifact {
+    pub size: usize,
+    /// SHA-256 of the exact input bytes. Not a Solana program hash.
+    pub sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ElfFacts {
+    pub e_machine: u16,
+    pub e_flags: u32,
+    /// sBPF version read from `e_flags`, as the Solana loader maps it.
+    pub sbpf_version: String,
+    /// File offset of the entrypoint instruction, when it lies inside `.text`.
+    pub entrypoint_offset: Option<u64>,
+    pub sections: Vec<SectionFact>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SectionFact {
+    pub name: String,
+    pub file_offset: u64,
+    pub size: u64,
+}
+
+/// A call target named through a relocation or a static syscall hash.
+#[derive(Debug, Serialize)]
+pub struct SyscallUse {
+    pub name: String,
+    /// True when the name is in the registered Solana syscall list. False means
+    /// a named symbol that is not a syscall, such as a program's `custom_panic`.
+    pub registered: bool,
+    /// File offsets of the call instructions.
+    pub call_sites: Vec<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConstantCoverage {
+    /// 64-bit immediates found as `lddw` (sBPF v0 and v1).
+    pub lddw: usize,
+    /// 64-bit immediates found as `mov32` followed by `hor64` (sBPF v2 and later).
+    pub mov32_hor64: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StringFact {
+    pub file_offset: u64,
+    pub section: String,
+    pub text: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnchorFacts {
+    /// True when a corroborated instruction, the IDL instruction tag or Anchor's
+    /// error strings were found. Instruction log strings alone do not count.
+    pub detected: bool,
+    pub markers: Vec<Marker>,
+    pub instructions: Vec<RecoveredInstruction>,
+    /// Instruction log strings whose name could not be corroborated.
+    pub uncorroborated_instruction_logs: Vec<UncorroboratedLog>,
+    pub accounts: Vec<RecoveredType>,
+    pub events: Vec<RecoveredType>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Marker {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub evidence: Vec<Evidence>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Evidence {
+    pub kind: EvidenceKind,
+    pub file_offset: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    /// A 64-bit immediate loaded by `lddw`.
+    LddwImmediate,
+    /// A 64-bit immediate built by `mov32` + `hor64`.
+    Mov32Hor64Immediate,
+    /// The bytes appear in a data section.
+    DataBytes,
+    /// A log or error string in a data section.
+    String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecoveredInstruction {
+    /// Inferred Rust handler name, as Anchor hashes it.
+    pub name: String,
+    /// The name as it appears in the program's log string.
+    pub log_name: String,
+    /// `sha256("global:" + name)[..8]`, hex. Absent for framework instructions,
+    /// which Anchor dispatches through its IDL instruction tag instead.
+    pub discriminator: Option<String>,
+    /// `framework` for Anchor's own IDL-management instructions, `corroborated` otherwise.
+    pub status: InstructionStatus,
+    /// Log strings whose text contains this name.
+    pub log_string_offsets: Vec<u64>,
+    /// Where the discriminator bytes were found. Empty for framework instructions.
+    pub discriminator_evidence: Vec<Evidence>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InstructionStatus {
+    Corroborated,
+    Framework,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UncorroboratedLog {
+    pub log_token: String,
+    pub file_offset: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecoveredType {
+    pub name: String,
+    /// `sha256("account:" + name)[..8]` or `sha256("event:" + name)[..8]`, hex.
+    pub discriminator: String,
+    pub discriminator_evidence: Vec<Evidence>,
+}

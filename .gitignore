@@ -1,0 +1,6 @@
+/target
+/pkg
+/fixtures/*/target
+/fixtures/*/Cargo.lock
+tests/fixtures/*-keypair.json
+*.pdb

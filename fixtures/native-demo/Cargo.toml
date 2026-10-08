@@ -1,0 +1,15 @@
+# Source-owned test program: built with cargo-build-sbf into tests/fixtures/.
+[package]
+name = "inspect-fixture-native"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "inspect_fixture_native"
+
+[dependencies]
+solana-program = "2.3.0"
+
+[workspace]

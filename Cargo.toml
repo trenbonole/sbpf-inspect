@@ -1,0 +1,32 @@
+[package]
+name = "sbpf-inspect"
+version = "0.1.0"
+edition = "2024"
+description = "Offline interface recovery for Solana sBPF programs: ELF facts, syscalls, strings and corroborated Anchor instruction, account and event names."
+license = "MIT OR Apache-2.0"
+keywords = ["solana", "sbpf", "reverse-engineering", "anchor", "idl"]
+categories = ["development-tools", "wasm"]
+
+[lib]
+name = "sbpf_inspect"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "sbpf-inspect"
+path = "src/main.rs"
+
+[dependencies]
+either = "1.16.0"
+sbpf-common = "0.3.2"
+sbpf-disassembler = "0.3.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2.110"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
