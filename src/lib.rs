@@ -5,6 +5,7 @@
 //! inferred and corroborated from it (Anchor instruction, account and event
 //! names). It never executes the program and never touches the network.
 
+pub mod accounts;
 pub mod anchor;
 pub mod constants;
 pub mod report;
@@ -65,10 +66,11 @@ fn is_data_section(name: &str) -> bool {
 
 const UNKNOWNS: &[&str] = &[
     "Instruction names come from Anchor's `Instruction: <Name>` log strings. Programs built without those logs, native programs and other frameworks yield none.",
-    "A discriminator counts as found only when its 8 bytes are a 64-bit immediate (`lddw`, or `mov32` + `hor64` on sBPF v2 and later) or appear in a data section. Other code shapes, such as two 32-bit comparisons, are not detected.",
+    "A discriminator counts as found only when its 8 bytes are a 64-bit immediate (`lddw`, or `mov32` + `hor64` on sBPF v2 and later) or appear in a data section, or, for instructions, when bytes 2 to 7 are compared one at a time in order (byte-wise dispatch). Other code shapes, such as two 32-bit comparisons, are not detected.",
     "Event names are recovered only when the name appears in the program's strings. Calls a program makes to itself starting with Anchor's event tag (see the event_cpi_tag marker) carry events, not instructions.",
     "Account names are recovered only when the name itself appears in the program's strings. A recovered account type can belong to another program this one validates, such as pump AMM's Pool inside pump.fun's bonding-curve program.",
-    "Instruction arguments, account lists, constraints and error codes are not recovered.",
+    "Account lists are recovered only for Anchor instructions whose accounts check (try_accounts) can be located, and list only accounts whose names the binary embeds. An account positioned `matched` or `appended` was named only by later checks, so its position is weaker evidence. Of the constraints, only mut and signer are reported.",
+    "Instruction arguments and error codes defined by the program are not recovered.",
     "Deployment identity, upgrade authority, verified-build status and runtime behaviour are unknown: the analysis is offline and does not execute the program.",
 ];
 
@@ -118,12 +120,21 @@ pub fn inspect(bytes: &[u8]) -> Result<Report, InspectError> {
     }
 
     let constants = constants::scan(&text, text_offset, e_flags);
+    let chains = constants::ByteCompares::scan(&text, text_offset);
     let data_sections: Vec<anchor::DataSection> = sections
         .iter()
         .filter(|(name, _, _)| is_data_section(name))
         .map(|(_, off, data)| anchor::DataSection { file_offset: *off, data })
         .collect();
-    let anchor = anchor::analyze(&constants, &data_sections);
+    let mut anchor = anchor::analyze(&constants, &chains, &data_sections);
+    // Account lists, matched to instructions by the name in their log string.
+    let checks = accounts::recover(bytes);
+    for ix in &mut anchor.instructions {
+        if let Some(Some(check)) = checks.get(&ix.log_name) {
+            ix.accounts_check_offset = Some(check.check_offset);
+            ix.accounts = Some(check.accounts.clone());
+        }
+    }
 
     let strings = sections
         .iter()
@@ -162,6 +173,7 @@ pub fn inspect(bytes: &[u8]) -> Result<Report, InspectError> {
         constants: ConstantCoverage {
             lddw: constants.iter().filter(|c| c.kind == EvidenceKind::LddwImmediate).count(),
             mov32_hor64: constants.iter().filter(|c| c.kind == EvidenceKind::Mov32Hor64Immediate).count(),
+            byte_compares: chains.len(),
         },
         strings,
         anchor,

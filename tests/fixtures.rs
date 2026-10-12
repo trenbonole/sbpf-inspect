@@ -64,6 +64,40 @@ fn anchor_accounts_and_events_need_their_names_in_the_binary() {
 }
 
 #[test]
+fn anchor_account_lists_follow_the_accounts_structs() {
+    let r = load("inspect_fixture_anchor.so");
+    let list = |name: &str| -> Vec<(String, bool, bool)> {
+        let ix = r.anchor.instructions.iter().find(|i| i.name == name).expect("instruction recovered");
+        assert!(ix.accounts_check_offset.is_some(), "{name}: accounts check located");
+        let accounts = ix.accounts.as_ref().expect("account list recovered");
+        accounts.iter().map(|a| (a.name.clone(), a.writable, a.signer)).collect()
+    };
+    let expect = |v: &[(&str, bool, bool)]| -> Vec<(String, bool, bool)> {
+        v.iter().map(|(n, w, s)| (n.to_string(), *w, *s)).collect()
+    };
+    // `init` accounts without seeds are created by the payer and must sign; `mut` is writable.
+    assert_eq!(
+        list("initialize"),
+        expect(&[("settings", true, true), ("vault", true, true), ("authority", true, true), ("system_program", false, false)])
+    );
+    assert_eq!(list("deposit_v2"), expect(&[("vault", true, false), ("depositor", false, true)]));
+    assert_eq!(list("step_2"), expect(&[("settings", false, false)]));
+    assert_eq!(list("set_authority"), expect(&[("settings", true, false), ("authority", false, true)]));
+
+    let text = r.elf.sections.iter().find(|s| s.name == ".text").expect(".text");
+    for ix in &r.anchor.instructions {
+        for a in ix.accounts.iter().flatten() {
+            if let Some(at) = a.load_offset {
+                assert!((text.file_offset..text.file_offset + text.size).contains(&at), "{}: load inside .text", a.name);
+            }
+            if a.writable {
+                assert!(a.error_codes.contains(&2000), "{}: writable needs its ConstraintMut path", a.name);
+            }
+        }
+    }
+}
+
+#[test]
 fn anchor_facts_are_observed() {
     let r = load("inspect_fixture_anchor.so");
     assert!(r.elf.entrypoint_offset.is_some());

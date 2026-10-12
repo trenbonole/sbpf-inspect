@@ -77,6 +77,9 @@ pub struct ConstantCoverage {
     pub lddw: usize,
     /// 64-bit immediates found as `mov32` followed by `hor64` (sBPF v2 and later).
     pub mov32_hor64: usize,
+    /// Conditional jumps comparing a register with one byte, searched for
+    /// byte-wise instruction dispatch.
+    pub byte_compares: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -134,6 +137,10 @@ pub enum EvidenceKind {
     LddwImmediate,
     /// A 64-bit immediate built by `mov32` + `hor64`.
     Mov32Hor64Immediate,
+    /// Bytes 2 to 7 compared one at a time, in order, by nearby conditional
+    /// jumps: the byte-wise dispatch older Anchor versions compile to. The
+    /// offset is the first of those comparisons.
+    ByteCompareChain,
     /// The bytes appear in a data section.
     DataBytes,
     /// A log or error string in a data section.
@@ -156,6 +163,50 @@ pub struct RecoveredInstruction {
     pub log_string_offsets: Vec<u64>,
     /// Where the discriminator bytes were found. Empty for framework instructions.
     pub discriminator_evidence: Vec<Evidence>,
+    /// File offset of the function that loads and checks this instruction's
+    /// accounts (Anchor's `try_accounts`), when it could be located.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accounts_check_offset: Option<u64>,
+    /// The instruction's accounts in order, recovered from its accounts check.
+    /// Absent when the check could not be located.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accounts: Option<Vec<RecoveredAccount>>,
+}
+
+/// One account of an instruction, as its accounts check loads and checks it.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoveredAccount {
+    /// The field name the program attaches to this account's errors.
+    pub name: String,
+    /// The account is checked to be writable (ConstraintMut, 2000).
+    pub writable: bool,
+    /// The account is checked to be a signer (ConstraintSigner, 2002, or
+    /// AccountNotSigner, 3010, raised by its checks or its loader).
+    pub signer: bool,
+    /// How the account's position in the list was established.
+    pub position: AccountPosition,
+    /// File offset of the call or inline take that loads the account, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_offset: Option<u64>,
+    /// Anchor error codes whose failure path names this account.
+    pub error_codes: Vec<u32>,
+    /// Anchor error codes the function that loads this account can raise.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub loader_error_codes: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountPosition {
+    /// Placed by its own load: the load's failure path names it, or its name is
+    /// checked where the loads happen.
+    Loaded,
+    /// Named only by later constraint checks (an `init` account, say) and matched,
+    /// in check order, to a load that names nothing.
+    Matched,
+    /// Named only by later checks with no unnamed load left: listed last, its
+    /// position is unknown.
+    Appended,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]

@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    constants::Constant,
+    constants::{ByteCompares, Constant},
     report::{
         AnchorFacts, Evidence, EvidenceKind, ImmediateUse, InstructionStatus, Marker,
         RecoveredInstruction, RecoveredType, UncorroboratedLog,
@@ -182,11 +182,12 @@ struct Haystack<'a> {
     values: HashSet<[u8; 8]>,
     constants: &'a [Constant],
     sections: &'a [DataSection<'a>],
+    chains: &'a ByteCompares,
     evidence: HashMap<[u8; 8], Vec<Evidence>>,
 }
 
 impl<'a> Haystack<'a> {
-    fn new(constants: &'a [Constant], sections: &'a [DataSection<'a>]) -> Self {
+    fn new(constants: &'a [Constant], sections: &'a [DataSection<'a>], chains: &'a ByteCompares) -> Self {
         let mut values = HashSet::new();
         for c in constants {
             values.insert(c.value.to_le_bytes());
@@ -198,7 +199,7 @@ impl<'a> Haystack<'a> {
                 values.insert(key);
             }
         }
-        Haystack { values, constants, sections, evidence: HashMap::new() }
+        Haystack { values, constants, sections, chains, evidence: HashMap::new() }
     }
 
     /// Evidence for `key`, or `None` when the program does not hold it.
@@ -208,6 +209,16 @@ impl<'a> Haystack<'a> {
         }
         let (constants, sections) = (self.constants, self.sections);
         Some(self.evidence.entry(key).or_insert_with(|| locate(key, constants, sections)))
+    }
+
+    /// Like [`Haystack::find`], also accepting byte-wise dispatch: an instruction discriminator
+    /// whose bytes the code compares one at a time.
+    fn find_instruction(&mut self, key: [u8; 8]) -> Option<Vec<Evidence>> {
+        if let Some(found) = self.find(key) {
+            return Some(found.clone());
+        }
+        let at = self.chains.find_chain(key)?;
+        Some(vec![Evidence { kind: EvidenceKind::ByteCompareChain, file_offset: at, use_after_load: Some(ImmediateUse::Compare) }])
     }
 }
 
@@ -269,8 +280,8 @@ fn type_candidates(run: &str, out: &mut HashSet<String>) {
 }
 
 /// Recover Anchor instruction, account and event names from one program.
-pub fn analyze(constants: &[Constant], sections: &[DataSection]) -> AnchorFacts {
-    let mut haystack = Haystack::new(constants, sections);
+pub fn analyze(constants: &[Constant], chains: &ByteCompares, sections: &[DataSection]) -> AnchorFacts {
+    let mut haystack = Haystack::new(constants, sections, chains);
 
     // 1. Instruction log strings.
     let mut logs = Vec::new();
@@ -307,8 +318,8 @@ pub fn analyze(constants: &[Constant], sections: &[DataSection]) -> AnchorFacts 
             }
             for snake in snake_variants(prefix) {
                 let key = discriminator("global", &snake);
-                if let Some(evidence) = haystack.find(key) {
-                    corroborated.push((snake, prefix.to_string(), key, evidence.clone()));
+                if let Some(evidence) = haystack.find_instruction(key) {
+                    corroborated.push((snake, prefix.to_string(), key, evidence));
                 }
             }
         }
@@ -327,6 +338,8 @@ pub fn analyze(constants: &[Constant], sections: &[DataSection]) -> AnchorFacts 
                     status: InstructionStatus::Framework,
                     log_string_offsets: Vec::new(),
                     discriminator_evidence: Vec::new(),
+                    accounts_check_offset: None,
+                    accounts: None,
                 })
                 .log_string_offsets
                 .push(log.file_offset);
@@ -347,6 +360,8 @@ pub fn analyze(constants: &[Constant], sections: &[DataSection]) -> AnchorFacts 
                 status: InstructionStatus::Implemented,
                 log_string_offsets: Vec::new(),
                 discriminator_evidence: evidence,
+                accounts_check_offset: None,
+                accounts: None,
             });
             if !entry.log_string_offsets.contains(&log.file_offset) {
                 entry.log_string_offsets.push(log.file_offset);
@@ -478,7 +493,7 @@ mod tests {
         let mut data = b"Instruction: BuyProgram log: Instruction: Sell\0".to_vec();
         data.extend_from_slice(&disc);
         let sections = [DataSection { file_offset: 0x1000, data: &data }];
-        let facts = analyze(&[], &sections);
+        let facts = analyze(&[], &ByteCompares::default(), &sections);
         let names: Vec<_> = facts.instructions.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, ["buy"], "sell has no discriminator in the binary");
         assert_eq!(facts.uncorroborated_instruction_logs.len(), 1);
@@ -488,7 +503,7 @@ mod tests {
     #[test]
     fn idl_instruction_survives_a_packed_literal() {
         let data = b"Instruction: IdlResizeAccountdata_len";
-        let facts = analyze(&[], &[DataSection { file_offset: 0, data }]);
+        let facts = analyze(&[], &ByteCompares::default(), &[DataSection { file_offset: 0, data }]);
         assert_eq!(facts.instructions.len(), 1);
         assert_eq!(facts.instructions[0].name, "idl_resize_account");
         assert_eq!(facts.instructions[0].status, InstructionStatus::Framework);
@@ -500,7 +515,7 @@ mod tests {
         let disc = discriminator("global", "idl_writer");
         let mut data = b"Instruction: IdlWriter\0".to_vec();
         data.extend_from_slice(&disc);
-        let facts = analyze(&[], &[DataSection { file_offset: 0, data: &data }]);
+        let facts = analyze(&[], &ByteCompares::default(), &[DataSection { file_offset: 0, data: &data }]);
         assert_eq!(facts.instructions.len(), 1);
         assert_eq!(facts.instructions[0].name, "idl_writer");
         assert_eq!(facts.instructions[0].status, InstructionStatus::Implemented);
@@ -512,7 +527,7 @@ mod tests {
         let mut data = b"Instruction: BurnStranded ".to_vec();
         data.extend_from_slice(&discriminator("global", "burn_stranded"));
         data.extend_from_slice(&discriminator("global", "burn"));
-        let facts = analyze(&[], &[DataSection { file_offset: 0, data: &data }]);
+        let facts = analyze(&[], &ByteCompares::default(), &[DataSection { file_offset: 0, data: &data }]);
         let status: Vec<_> = facts.instructions.iter().map(|i| (i.name.as_str(), i.status)).collect();
         assert_eq!(
             status,
@@ -526,7 +541,7 @@ mod tests {
         let disc = discriminator("account", "Settings");
         let mut data = b"\xd3\x08uwsettings\0".to_vec();
         data.extend_from_slice(&disc);
-        let facts = analyze(&[], &[DataSection { file_offset: 0, data: &data }]);
+        let facts = analyze(&[], &ByteCompares::default(), &[DataSection { file_offset: 0, data: &data }]);
         let names: Vec<_> = facts.accounts.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, ["Settings"]);
     }

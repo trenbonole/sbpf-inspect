@@ -57,6 +57,70 @@ fn first_use(text: &[u8], from: usize, reg: u8) -> ImmediateUse {
     ImmediateUse::Other
 }
 
+const OP_JEQ_IMM: u8 = 0x15;
+const OP_JNE_IMM: u8 = 0x55;
+/// How many instructions after one byte comparison the next one may sit.
+const CHAIN_GAP: usize = 16;
+
+/// Conditional jumps that compare a register with one byte (`jeq`/`jne` with an
+/// immediate from 0 to 255), indexed for discriminator lookups.
+///
+/// Older Anchor versions compile instruction dispatch to a byte-wise decision
+/// tree: a switch on the first discriminator bytes, then a chain of
+/// comparisons against the remaining bytes, one at a time. The tree can share
+/// the first two bytes between instructions, so a chain is matched on bytes 2
+/// to 7: six comparisons in order, each within [`CHAIN_GAP`] instructions of
+/// the previous one.
+#[derive(Debug, Default)]
+pub struct ByteCompares {
+    /// The compared byte at each instruction position, if that instruction is a byte comparison.
+    byte_at: Vec<Option<u8>>,
+    file_offset: Vec<u64>,
+    by_byte: Vec<Vec<usize>>,
+}
+
+impl ByteCompares {
+    pub fn scan(text: &[u8], text_file_offset: u64) -> Self {
+        let mut out = ByteCompares { by_byte: vec![Vec::new(); 256], ..Default::default() };
+        let mut pos = 0usize;
+        while pos + 8 <= text.len() {
+            let opcode = text[pos];
+            let imm = i32::from_le_bytes([text[pos + 4], text[pos + 5], text[pos + 6], text[pos + 7]]);
+            let byte = (matches!(opcode, OP_JEQ_IMM | OP_JNE_IMM) && (0..=255).contains(&imm)).then_some(imm as u8);
+            if let Some(b) = byte {
+                out.by_byte[usize::from(b)].push(out.byte_at.len());
+            }
+            out.byte_at.push(byte);
+            out.file_offset.push(text_file_offset + pos as u64);
+            pos += if opcode == OP_LDDW { 16 } else { 8 };
+        }
+        out
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_byte.iter().map(Vec::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// File offset of the first comparison of a chain over bytes 2 to 7 of `value`, if there is one.
+    pub fn find_chain(&self, value: [u8; 8]) -> Option<u64> {
+        for &start in self.by_byte.get(usize::from(value[2]))? {
+            let mut at = start;
+            let complete = value[3..].iter().all(|&b| {
+                let next = (at + 1..=at + CHAIN_GAP).take_while(|&k| k < self.byte_at.len()).find(|&k| self.byte_at[k] == Some(b));
+                next.inspect(|&k| at = k).is_some()
+            });
+            if complete {
+                return Some(self.file_offset[start]);
+            }
+        }
+        None
+    }
+}
+
 /// Scan `.text` for 64-bit immediates. `text_file_offset` is the section's file offset.
 pub fn scan(text: &[u8], text_file_offset: u64, sbpf_version: u32) -> Vec<Constant> {
     let mut out = scan_lddw(text, text_file_offset);
@@ -163,6 +227,29 @@ mod tests {
             0xb7, 0x01, 0, 0, 0, 0, 0, 0,
         ];
         assert_eq!(scan(&overwritten, 0, 0)[0].use_after_load, ImmediateUse::Other);
+    }
+
+    fn jump(opcode: u8, imm: u8) -> [u8; 8] {
+        [opcode, 0x03, 0x10, 0x00, imm, 0, 0, 0]
+    }
+
+    #[test]
+    fn byte_chain_follows_byte_wise_dispatch() {
+        // Bytes 2..7 compared in order with a load between each, as older Anchor dispatch does.
+        let value = [0xd3, 0x16, 0xdd, 0xfb, 0x4a, 0x79, 0xc1, 0x2f];
+        let mut text = Vec::new();
+        for (k, &b) in value[2..].iter().enumerate() {
+            text.extend_from_slice(&[0x79, 0x34, 0, 0, 0, 0, 0, 0]); // ldxdw r4, [r3]
+            text.extend_from_slice(&jump(if k == 5 { OP_JEQ_IMM } else { OP_JNE_IMM }, b));
+        }
+        let chains = ByteCompares::scan(&text, 0x200);
+        assert_eq!(chains.find_chain(value), Some(0x208));
+        let mut other = value;
+        other[5] ^= 1;
+        assert_eq!(chains.find_chain(other), None, "every byte from 2 to 7 must be compared");
+        let mut out_of_order = value;
+        out_of_order.swap(3, 4);
+        assert_eq!(chains.find_chain(out_of_order), None, "the bytes must be compared in order");
     }
 
     #[test]
