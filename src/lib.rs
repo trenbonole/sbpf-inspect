@@ -66,7 +66,8 @@ fn is_data_section(name: &str) -> bool {
 const UNKNOWNS: &[&str] = &[
     "Instruction names come from Anchor's `Instruction: <Name>` log strings. Programs built without those logs, native programs and other frameworks yield none.",
     "A discriminator counts as found only when its 8 bytes are a 64-bit immediate (`lddw`, or `mov32` + `hor64` on sBPF v2 and later) or appear in a data section. Other code shapes, such as two 32-bit comparisons, are not detected.",
-    "Account and event names are recovered only when the name itself appears in the program's strings. A recovered account type can belong to another program this one validates, such as pump AMM's Pool inside pump.fun's bonding-curve program.",
+    "Event names are recovered only when the name appears in the program's strings. Calls a program makes to itself starting with Anchor's event tag (see the event_cpi_tag marker) carry events, not instructions.",
+    "Account names are recovered only when the name itself appears in the program's strings. A recovered account type can belong to another program this one validates, such as pump AMM's Pool inside pump.fun's bonding-curve program.",
     "Instruction arguments, account lists, constraints and error codes are not recovered.",
     "Deployment identity, upgrade authority, verified-build status and runtime behaviour are unknown: the analysis is offline and does not execute the program.",
 ];

@@ -19,8 +19,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     constants::Constant,
     report::{
-        AnchorFacts, Evidence, EvidenceKind, InstructionStatus, Marker, RecoveredInstruction,
-        RecoveredType, UncorroboratedLog,
+        AnchorFacts, Evidence, EvidenceKind, ImmediateUse, InstructionStatus, Marker,
+        RecoveredInstruction, RecoveredType, UncorroboratedLog,
     },
 };
 
@@ -28,6 +28,9 @@ const INSTRUCTION_LOG_PREFIX: &[u8] = b"Instruction: ";
 const ANCHOR_ERROR: &[u8] = b"AnchorError";
 /// `anchor_lang::idl::IDL_IX_TAG`, the tag Anchor's IDL-management instructions start with.
 pub const IDL_IX_TAG: u64 = 0x0a69_e9a7_78bc_f440;
+/// `anchor_lang::event::EVENT_IX_TAG`: `emit_cpi!` calls the program itself with
+/// this tag followed by the event's discriminator.
+pub const EVENT_IX_TAG: u64 = 0x1d9a_cb51_2ea5_45e4;
 /// Anchor's own IDL-management instructions, logged like user instructions.
 const IDL_INSTRUCTIONS: &[&str] = &[
     "IdlCreateAccount",
@@ -159,12 +162,16 @@ fn locate(value_le: [u8; 8], constants: &[Constant], sections: &[DataSection]) -
     let mut out = Vec::new();
     for c in constants {
         if c.value.to_le_bytes() == value_le {
-            out.push(Evidence { kind: c.kind, file_offset: c.file_offset });
+            out.push(Evidence { kind: c.kind, file_offset: c.file_offset, use_after_load: Some(c.use_after_load) });
         }
     }
     for s in sections {
         for i in find_all(s.data, &value_le) {
-            out.push(Evidence { kind: EvidenceKind::DataBytes, file_offset: s.file_offset + i as u64 });
+            out.push(Evidence {
+                kind: EvidenceKind::DataBytes,
+                file_offset: s.file_offset + i as u64,
+                use_after_load: None,
+            });
         }
     }
     out
@@ -288,6 +295,8 @@ pub fn analyze(constants: &[Constant], sections: &[DataSection]) -> AnchorFacts 
     //    (`BuyProgram log...`), so every prefix is a candidate and the
     //    discriminator decides which ones are real.
     let mut instructions: BTreeMap<String, RecoveredInstruction> = BTreeMap::new();
+    // Names that are the longest corroborated name of at least one log string.
+    let mut primary: HashSet<String> = HashSet::new();
     let mut uncorroborated = Vec::new();
     for log in &logs {
         let mut corroborated: Vec<(String, String, [u8; 8], Vec<Evidence>)> = Vec::new();
@@ -326,12 +335,16 @@ pub fn analyze(constants: &[Constant], sections: &[DataSection]) -> AnchorFacts 
         if corroborated.is_empty() {
             uncorroborated.push(UncorroboratedLog { log_token: log.token.clone(), file_offset: log.file_offset });
         }
+        if let Some((snake, _, _, _)) = corroborated.iter().max_by_key(|(_, prefix, _, _)| prefix.len()) {
+            primary.insert(snake.clone());
+        }
         for (snake, prefix, key, evidence) in corroborated {
             let entry = instructions.entry(snake.clone()).or_insert_with(|| RecoveredInstruction {
                 name: snake,
                 log_name: prefix,
                 discriminator: Some(hex(&key)),
-                status: InstructionStatus::Corroborated,
+                // Settled below, once every log string has been seen.
+                status: InstructionStatus::Implemented,
                 log_string_offsets: Vec::new(),
                 discriminator_evidence: evidence,
             });
@@ -339,6 +352,26 @@ pub fn analyze(constants: &[Constant], sections: &[DataSection]) -> AnchorFacts 
                 entry.log_string_offsets.push(log.file_offset);
             }
         }
+    }
+
+    // Implemented or referenced. A discriminator compared right after it is
+    // loaded is dispatch; one that is only stored builds a call to another
+    // program. Without code immediates (memcmp against data bytes), a name
+    // counts as implemented when it is the longest name in its own log string.
+    for ix in instructions.values_mut() {
+        if ix.status == InstructionStatus::Framework {
+            continue;
+        }
+        let uses: Vec<ImmediateUse> = ix.discriminator_evidence.iter().filter_map(|e| e.use_after_load).collect();
+        ix.status = if uses.contains(&ImmediateUse::Compare) {
+            InstructionStatus::Implemented
+        } else if !uses.is_empty() && uses.iter().all(|u| *u == ImmediateUse::Store) {
+            InstructionStatus::Referenced
+        } else if primary.contains(&ix.name) {
+            InstructionStatus::Implemented
+        } else {
+            InstructionStatus::Referenced
+        };
     }
 
     // 3. Accounts and events.
@@ -367,7 +400,11 @@ pub fn analyze(constants: &[Constant], sections: &[DataSection]) -> AnchorFacts 
     let mut error_strings = Vec::new();
     for s in sections {
         for at in find_all(s.data, ANCHOR_ERROR) {
-            error_strings.push(Evidence { kind: EvidenceKind::String, file_offset: s.file_offset + at as u64 });
+            error_strings.push(Evidence {
+                kind: EvidenceKind::String,
+                file_offset: s.file_offset + at as u64,
+                use_after_load: None,
+            });
         }
     }
     let markers = vec![
@@ -376,13 +413,18 @@ pub fn analyze(constants: &[Constant], sections: &[DataSection]) -> AnchorFacts 
             description: "`Instruction: <Name>` strings Anchor logs on handler entry",
             evidence: logs
                 .iter()
-                .map(|l| Evidence { kind: EvidenceKind::String, file_offset: l.file_offset })
+                .map(|l| Evidence { kind: EvidenceKind::String, file_offset: l.file_offset, use_after_load: None })
                 .collect(),
         },
         Marker {
             name: "idl_instruction_tag",
             description: "Anchor's IDL-management instruction tag 0x0a69e9a778bcf440",
             evidence: locate(IDL_IX_TAG.to_le_bytes(), constants, sections),
+        },
+        Marker {
+            name: "event_cpi_tag",
+            description: "Anchor's emit_cpi! self-call tag 0x1d9acb512ea545e4; such calls carry events, not instructions",
+            evidence: locate(EVENT_IX_TAG.to_le_bytes(), constants, sections),
         },
         Marker {
             name: "anchor_error_strings",
@@ -393,7 +435,7 @@ pub fn analyze(constants: &[Constant], sections: &[DataSection]) -> AnchorFacts 
 
     // Log strings alone are a weak signal: any program can log `Instruction: X`.
     // Detection needs a corroborated instruction, the IDL tag or Anchor's error strings.
-    let detected = instructions.values().any(|i| i.status == InstructionStatus::Corroborated)
+    let detected = instructions.values().any(|i| i.status == InstructionStatus::Implemented)
         || markers.iter().filter(|m| m.name != "instruction_log_strings").any(|m| !m.evidence.is_empty());
 
     AnchorFacts {
@@ -461,7 +503,21 @@ mod tests {
         let facts = analyze(&[], &[DataSection { file_offset: 0, data: &data }]);
         assert_eq!(facts.instructions.len(), 1);
         assert_eq!(facts.instructions[0].name, "idl_writer");
-        assert_eq!(facts.instructions[0].status, InstructionStatus::Corroborated);
+        assert_eq!(facts.instructions[0].status, InstructionStatus::Implemented);
+    }
+
+    #[test]
+    fn shorter_prefix_without_its_own_log_is_referenced() {
+        // `burn` is only a prefix of `BurnStranded`: a call target, not a handler.
+        let mut data = b"Instruction: BurnStranded ".to_vec();
+        data.extend_from_slice(&discriminator("global", "burn_stranded"));
+        data.extend_from_slice(&discriminator("global", "burn"));
+        let facts = analyze(&[], &[DataSection { file_offset: 0, data: &data }]);
+        let status: Vec<_> = facts.instructions.iter().map(|i| (i.name.as_str(), i.status)).collect();
+        assert_eq!(
+            status,
+            [("burn", InstructionStatus::Referenced), ("burn_stranded", InstructionStatus::Implemented)]
+        );
     }
 
     #[test]

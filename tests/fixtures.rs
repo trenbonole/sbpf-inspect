@@ -20,7 +20,7 @@ fn anchor_instructions_are_recovered_and_corroborated() {
         .anchor
         .instructions
         .iter()
-        .filter(|i| i.status == InstructionStatus::Corroborated)
+        .filter(|i| i.status == InstructionStatus::Implemented)
         .collect();
     let names: Vec<_> = user.iter().map(|i| i.name.as_str()).collect();
     // `deposit_v2` checks letter-digit words, `step_2` the digit spelling heck does not produce.

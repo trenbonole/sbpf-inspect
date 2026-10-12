@@ -153,8 +153,10 @@ All offsets are byte offsets into the input file. Evidence kinds are
   validates.
 - Instruction arguments, account lists, constraints and error codes are not
   recovered yet.
-- Tested on sBPF v0 binaries, which is what mainnet programs use today. The v2+
-  immediate scan is covered by unit tests only.
+- Tested on mainnet sBPF v0 and v3 binaries. The `mov32` + `hor64` immediate
+  shape used by sBPF v2 compilers is covered by unit tests only.
+- An instruction whose discriminator is only stored, never compared, is reported
+  as `referenced`: usually an instruction this program calls on another program.
 
 ## Development
 

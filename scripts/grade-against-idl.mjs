@@ -7,7 +7,8 @@ const idl = JSON.parse(readFileSync(idlPath, "utf8"));
 const hex = (a) => Buffer.from(a).toString("hex");
 
 const truth = new Map(idl.instructions.map((i) => [i.name, hex(i.discriminator)]));
-const got = r.anchor.instructions.filter((i) => i.status === "corroborated");
+const got = r.anchor.instructions.filter((i) => i.status === "implemented");
+const referenced = r.anchor.instructions.filter((i) => i.status === "referenced");
 const right = got.filter((i) => truth.get(i.name) === i.discriminator);
 const wrong = got.filter((i) => truth.get(i.name) !== i.discriminator);
 const missed = [...truth.keys()].filter((n) => !got.some((i) => i.name === n));
@@ -22,5 +23,6 @@ for (const [kind, list, recovered] of [["accounts", idl.accounts || [], r.anchor
   console.log(`${kind}: ${ok.length}/${t.size} recovered, ${extra.length} not in IDL`);
   if (extra.length) console.log("  not in IDL:", extra.map((a) => a.name).join(", "));
 }
+console.log(`referenced (called, not implemented): ${referenced.map((i) => i.name).join(", ") || "none"}`);
 console.log(`framework IDL instructions: ${r.anchor.instructions.filter((i) => i.status === "framework").length}, uncorroborated log strings: ${r.anchor.uncorroborated_instruction_logs.length}`);
 console.log(`sbpf ${r.elf.sbpf_version}, ${r.syscalls.length} named calls, ${r.constants.lddw + r.constants.mov32_hor64} 64-bit immediates, diagnostics ${r.diagnostics.length}`);

@@ -110,6 +110,21 @@ pub struct Marker {
 pub struct Evidence {
     pub kind: EvidenceKind,
     pub file_offset: u64,
+    /// For code immediates: what the code does first with the loaded value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_after_load: Option<ImmediateUse>,
+}
+
+/// The first use of a 64-bit immediate after it is loaded into a register.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ImmediateUse {
+    /// Read by a conditional jump, as when dispatching on an instruction discriminator.
+    Compare,
+    /// Stored to memory, as when building instruction data for a call to another program.
+    Store,
+    /// Used some other way, overwritten, or not used within the search window.
+    Other,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -134,7 +149,8 @@ pub struct RecoveredInstruction {
     /// `sha256("global:" + name)[..8]`, hex. Absent for framework instructions,
     /// which Anchor dispatches through its IDL instruction tag instead.
     pub discriminator: Option<String>,
-    /// `framework` for Anchor's own IDL-management instructions, `corroborated` otherwise.
+    /// Whether this program handles the instruction, only references it, or is
+    /// Anchor's own IDL-management instruction.
     pub status: InstructionStatus,
     /// Log strings whose text contains this name.
     pub log_string_offsets: Vec<u64>,
@@ -145,7 +161,15 @@ pub struct RecoveredInstruction {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InstructionStatus {
-    Corroborated,
+    /// A handler of this program: the discriminator is compared right after it
+    /// is loaded, or, when the code shape is not visible, the name is the
+    /// longest corroborated name in its own log string.
+    Implemented,
+    /// The discriminator is in the binary but is only written to memory, or the
+    /// name is just a shorter prefix of another handler's log string. Typically
+    /// an instruction this program calls on another program.
+    Referenced,
+    /// Anchor's own IDL-management instruction.
     Framework,
 }
 

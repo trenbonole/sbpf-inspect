@@ -1,17 +1,21 @@
 //! 64-bit immediates loaded by the program's code.
 //!
 //! Discriminators and other 8-byte tags are usually compared against a register
-//! that was loaded with a 64-bit immediate. sBPF v0 and v1 load those with the
-//! two-slot `lddw`; v2 removed `lddw` (SIMD-0173), so compilers build the value
-//! with `mov32` for the low half and `hor64` for the high half.
+//! that was loaded with a 64-bit immediate. Most programs load those with the
+//! two-slot `lddw`, including sBPF v3 programs on mainnet. sBPF v2 removed
+//! `lddw` (SIMD-0173), and compilers targeting it build the value with `mov32`
+//! for the low half and `hor64` for the high half, so v2 and later are scanned
+//! for both shapes.
 
-use crate::report::EvidenceKind;
+use crate::report::{EvidenceKind, ImmediateUse};
 
 const OP_LDDW: u8 = 0x18;
 const OP_MOV32_IMM: u8 = 0xb4;
 const OP_HOR64_IMM: u8 = 0xf7;
 /// How many instruction slots back a `hor64` may look for its `mov32`.
 const MOV32_WINDOW: usize = 4;
+/// How many instruction slots after a load are searched for the value's first use.
+const USE_WINDOW: usize = 8;
 
 /// One 64-bit immediate and where its loading instruction sits in the file.
 #[derive(Debug, Clone, Copy)]
@@ -19,15 +23,47 @@ pub struct Constant {
     pub value: u64,
     pub file_offset: u64,
     pub kind: EvidenceKind,
+    /// What the code does first with the loaded register.
+    pub use_after_load: ImmediateUse,
+}
+
+/// First use of register `reg` in the instructions starting at `from`.
+///
+/// A conditional jump that reads it is a comparison, as in instruction
+/// dispatch; a register store of it writes the value to memory, as when
+/// building instruction data for a call to another program. Any other write
+/// to the register ends the search.
+fn first_use(text: &[u8], from: usize, reg: u8) -> ImmediateUse {
+    for insn in text.get(from..).unwrap_or(&[]).chunks_exact(8).take(USE_WINDOW) {
+        let opcode = insn[0];
+        let dst = insn[1] & 0x0f;
+        let src = insn[1] >> 4;
+        let class = opcode & 0x07;
+        let reads_src = opcode & 0x08 != 0;
+        match class {
+            // jmp and jmp32, excluding ja, call, callx and exit/return.
+            0x05 | 0x06 if !matches!(opcode, 0x05 | 0x85 | 0x8d | 0x95 | 0x9d) => {
+                if dst == reg || (reads_src && src == reg) {
+                    return ImmediateUse::Compare;
+                }
+            }
+            // stx: store register `src` to memory.
+            0x03 if src == reg => return ImmediateUse::Store,
+            // alu, alu64, ld, ldx: anything that writes `reg` replaces the value.
+            0x00 | 0x01 | 0x04 | 0x07 if dst == reg => return ImmediateUse::Other,
+            _ => {}
+        }
+    }
+    ImmediateUse::Other
 }
 
 /// Scan `.text` for 64-bit immediates. `text_file_offset` is the section's file offset.
 pub fn scan(text: &[u8], text_file_offset: u64, sbpf_version: u32) -> Vec<Constant> {
+    let mut out = scan_lddw(text, text_file_offset);
     if sbpf_version >= 2 {
-        scan_mov32_hor64(text, text_file_offset)
-    } else {
-        scan_lddw(text, text_file_offset)
+        out.extend(scan_mov32_hor64(text, text_file_offset));
     }
+    out
 }
 
 fn scan_lddw(text: &[u8], base: u64) -> Vec<Constant> {
@@ -41,6 +77,7 @@ fn scan_lddw(text: &[u8], base: u64) -> Vec<Constant> {
                 value: (u64::from(hi) << 32) | u64::from(lo),
                 file_offset: base + pos as u64,
                 kind: EvidenceKind::LddwImmediate,
+                use_after_load: first_use(text, pos + 16, text[pos + 1] & 0x0f),
             });
             pos += 16;
         } else {
@@ -65,6 +102,7 @@ fn scan_mov32_hor64(text: &[u8], base: u64) -> Vec<Constant> {
                     value: (u64::from(imm) << 32) | u64::from(lo),
                     file_offset: base + (mov_slot * 8) as u64,
                     kind: EvidenceKind::Mov32Hor64Immediate,
+                    use_after_load: first_use(text, (slot + 1) * 8, dst),
                 });
             }
         }
@@ -91,6 +129,40 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].value, 0x1122_3344_5566_7788);
         assert_eq!(found[0].file_offset, 0x100);
+    }
+
+    #[test]
+    fn lddw_is_scanned_on_v3_too() {
+        // sBPF v3 mainnet programs still use lddw; a v3 program must not lose it.
+        let text = [
+            0x18, 0x06, 0, 0, 0x52, 0xfb, 0xe9, 0x9c, //
+            0x00, 0x00, 0, 0, 0x0c, 0x34, 0xb8, 0xca,
+        ];
+        let found = scan(&text, 0, 3);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].value.to_le_bytes(), [0x52, 0xfb, 0xe9, 0x9c, 0x0c, 0x34, 0xb8, 0xca]);
+    }
+
+    #[test]
+    fn first_use_tells_dispatch_from_outgoing_calls() {
+        // lddw r6, X ; jeq r0, r6, +3   -> compared, as in dispatch
+        let compare = [
+            0x18, 0x06, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+            0x1d, 0x60, 3, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(scan(&compare, 0, 0)[0].use_after_load, ImmediateUse::Compare);
+        // lddw r1, X ; stxdw [r10-16], r1   -> stored, as when building a call
+        let store = [
+            0x18, 0x01, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+            0x7b, 0x1a, 0xf0, 0xff, 0, 0, 0, 0,
+        ];
+        assert_eq!(scan(&store, 0, 0)[0].use_after_load, ImmediateUse::Store);
+        // lddw r1, X ; mov64 r1, 0   -> overwritten before use
+        let overwritten = [
+            0x18, 0x01, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+            0xb7, 0x01, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(scan(&overwritten, 0, 0)[0].use_after_load, ImmediateUse::Other);
     }
 
     #[test]
