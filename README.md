@@ -10,23 +10,42 @@ for Node. It never executes the program and never touches the network.
 
 ## Results on real programs
 
-Graded against the IDLs pump.fun publishes in
-[pump-fun/pump-public-docs](https://github.com/pump-fun/pump-public-docs):
+Four mainnet programs, each graded against an answer key the tool never sees:
 
-| Program | Instructions | Account types | Wrong names | Time (WebAssembly) |
+| Program | Answer key | Instructions | Wrong names | Account types |
 |---|---|---|---|---|
-| pump.fun bonding curve, `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P` | 56 of 56 | 7 of 7 | 0 | 64 ms |
-| pump.fun AMM, `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` | 38 of 38 | 7 of 7 | 0 | 55 ms |
+| pump.fun bonding curve, `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P` | published IDL | 56 of 56 | 0 | 7 of 7 |
+| pump.fun AMM, `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` | published IDL | 38 of 38 | 0 | 7 of 7 |
+| Bordrless companion, `6ZUM1gWBH9hBBNoJoaVAGwSftyZ6CUda6vUZTW9MsJuo`, sBPF v3 | source code | 27 of 27 | 0 | 3 of 6 |
+| a closed-source launchpad, `BohF4FAftBwEBoa23sUgM8Vr5HL2nAHLx5s7b1iBK56f`, deleted by its owner | 2,263 runtime log lines | 23 of 23 called | 0 | 11 found, no key |
 
-Every recovered discriminator matches the published IDL byte for byte. The
-bonding-curve program also yields two account types its IDL does not list,
-`GlobalConfig` and `Pool`. Both are pump AMM types, and their discriminators
-match the AMM's IDL: the bonding curve checks them when it migrates a coin to the
-AMM.
+Each run takes under 100 ms. Notes on each:
 
-Measured 2026-10-08 on program data dumped near mainnet slot 454,696,749
-(SHA-256 of the dumps: `a4b32d32…9f16` and `a8d05e69…697e`). The programs are
-upgradeable, so a later dump can differ. To reproduce:
+- **pump.fun.** Every recovered discriminator matches the published IDL byte for
+  byte. The bonding curve also yields two account types its IDL does not list,
+  `GlobalConfig` and `Pool`. Both are pump AMM types, and the bonding curve
+  checks them when it migrates a coin to the AMM.
+- **Bordrless companion.** All 27 handlers in its
+  [source](https://github.com/BordrlessDex/bordrless-programs) are recovered and
+  none extra. The two instructions it calls on other programs, `burn` and `plan`,
+  are reported as `referenced` rather than as handlers. Its published IDL lists
+  21 of the 27; the other six were added since. Every instruction call it had
+  received on mainnet carries a recovered name. Three of its six account type
+  names never appear in the binary, so they cannot be recovered.
+- **Deleted launchpad.** The program was closed four days after deployment, so
+  there was no file to download. `scripts/rebuild-from-buffer.mjs` rebuilt it
+  byte for byte from the upload transactions of its final deployment. The
+  answer key comes from the program itself: in each of the 2,263 calls it
+  received it logged the instruction it ran, and
+  `scripts/answer-key-from-logs.mjs` pairs each call's first 8 bytes with that
+  name. All 23 instructions it was ever called with are named correctly. The
+  tool also recovers 30 handlers that were never called on mainnet, 11 account
+  types and one event, `Graduated`; nothing outside the binary can grade those.
+
+pump.fun was measured 2026-10-08 on program data dumped near mainnet slot
+454,696,749 (SHA-256 of the dumps: `a4b32d32…9f16` and `a8d05e69…697e`); the
+others on 2026-10-12. Programs are upgradeable, so a later dump can differ. To
+reproduce the pump.fun row:
 
 ```sh
 solana program dump -u mainnet-beta 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P pump.so
@@ -35,8 +54,8 @@ sbpf-inspect pump.so > pump.report.json
 node scripts/grade-against-idl.mjs pump.report.json pump.json
 ```
 
-Event names are not recovered on either program, because the names do not
-appear anywhere in the binaries. See [Limits](#limits).
+Event names are recovered only when they appear in the binary, which is rare.
+See [Limits](#limits).
 
 ## What it reports
 
@@ -50,10 +69,13 @@ appear anywhere in the binaries. See [Limits](#limits).
 **Inferred names**, each kept only when corroborated:
 
 - Anchor instructions, with the handler name, the name as logged, the
-  discriminator, and where the discriminator and the log string sit
+  discriminator, and where the discriminator and the log string sit. Each is
+  marked `implemented` (a handler of this program) or `referenced` (an
+  instruction it calls on another program)
 - Anchor's own IDL-management instructions, reported as framework instructions
 - account and event types, with discriminator and evidence
-- whether the program is Anchor, from the markers that say so
+- whether the program is Anchor, from the markers that say so, including the tag
+  of Anchor's event self-calls, which carry events rather than instructions
 
 Unrecovered facts are listed under `unknowns` in every report.
 
@@ -61,9 +83,10 @@ Unrecovered facts are listed under `unknowns` in every report.
 
 1. Parse the ELF with Blueshift's
    [`sbpf-disassembler`](https://github.com/blueshift-gg/sbpf).
-2. Collect every 64-bit immediate the code loads, as `lddw` on sBPF v0 and v1 or
-   as `mov32` plus `hor64` on v2 and later. Add every 8-byte window of the data
-   sections. That set is everything the program could compare against.
+2. Collect every 64-bit immediate the code loads, as `lddw` (which mainnet v0
+   and v3 programs both use) or as `mov32` plus `hor64` on v2 and later. Add
+   every 8-byte window of the data sections. That set is everything the program
+   could compare against.
 3. Build candidate names. Instruction candidates come from Anchor's
    `Instruction: <Name>` log strings, trying every prefix because Rust packs
    literals back to back (`Instruction: BuyProgram log...`), and trying both
@@ -74,6 +97,10 @@ Unrecovered facts are listed under `unknowns` in every report.
    `sha256("account:" + Name)[..8]` or `sha256("event:" + Name)[..8]`, and keep
    the name only when those 8 bytes are in the set. A string that merely looks
    like a name is never reported as one.
+5. Decide whether each instruction is a handler. A discriminator the code
+   compares right after loading it is dispatch, so the instruction is
+   `implemented`. One that is only written to memory is building a call to
+   another program, so it is `referenced`.
 
 ## Usage
 
@@ -172,10 +199,45 @@ for the tests. Each item in them exercises one case, such as a name packed
 against binary bytes, a digit spelling, a name that must stay unrecovered, or a
 native program that logs a string shaped like an Anchor instruction.
 
+**Grading a program with no IDL.** Two scripts build an answer key from the
+chain itself. They read an RPC endpoint from `RPC_URL`; the public endpoint
+works but throttles historical lookups heavily.
+
+```sh
+# Rebuild a deployed binary from the upload transactions of its deploy buffer,
+# which also works after the program has been closed.
+node scripts/rebuild-from-buffer.mjs <BUFFER_ADDRESS> program.so
+# Pair each call's first 8 bytes with the `Instruction: <Name>` line the program logged.
+node scripts/answer-key-from-logs.mjs <PROGRAM_ID> answer-key.json
+```
+
+The buffer address of each deployment is in the program-data account's
+`deployWithMaxDataLen` and `upgrade` transactions.
+
+## Prior art
+
+Sec3's [IDL Guesser](https://github.com/sec3-service/IDLGuesser), published in
+April 2025, introduced recovering Anchor instruction names from their
+`Instruction: <Name>` log strings and computing their discriminators. It goes
+further than this tool on per-instruction account lists and signer and writable
+flags. [solana-idl-extractor](https://github.com/dvrvsimi/solana-idl-extractor)
+takes a related approach.
+
+sbpf-inspect is written from scratch and uses no code from either. It differs
+in that it:
+
+- reports a name only when its discriminator is found in the binary, with the
+  offsets as evidence
+- recovers account and event type names
+- separates a program's handlers from the instructions it calls elsewhere
+- works offline on a local file and runs as WebAssembly
+- is MIT or Apache-2.0 licensed, so other tools can embed it
+
 ## Credits and license
 
 Built on Blueshift's `sbpf-disassembler` and `sbpf-common` (MIT). The
-discriminator scheme is Anchor's.
+discriminator scheme is Anchor's, and the log-string approach to instruction
+names follows Sec3's IDL Guesser.
 
 Licensed under either the [MIT license](LICENSE-MIT) or the
 [Apache License 2.0](LICENSE-APACHE), at your option.
