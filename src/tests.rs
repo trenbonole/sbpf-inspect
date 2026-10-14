@@ -387,8 +387,10 @@ fn program_messages_keep_the_programs_own_and_drop_the_frameworks() {
     let p = Program::load(&elf).unwrap();
     let cfg = Cfg::build(&p);
     let lits = crate::literals::recover(&p);
-    let msgs: Vec<String> = crate::messages::recover(&p, &cfg, &lits).into_iter().map(|m| m.message).collect();
+    let got = crate::messages::recover(&p, &cfg, &lits);
+    let msgs: Vec<String> = got.iter().map(|m| m.message.clone()).collect();
     assert_eq!(msgs, vec![m0.to_string(), m1.to_string()], "program messages only, framework and fragments dropped");
+    assert!(got.iter().all(|m| m.kind == "error"), "not logged here, so error");
 }
 
 /// xorshift64*: deterministic, so a failure reproduces.

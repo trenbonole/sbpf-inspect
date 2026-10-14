@@ -145,6 +145,8 @@ pub struct UnnamedInstruction {
 #[derive(Debug, Serialize)]
 pub struct ProgramMessageFact {
     pub message: String,
+    /// `error` (raised, e.g. an Anchor error enum or a panic) or `log` (handed to `sol_log_`).
+    pub kind: &'static str,
     /// File offset of the message string.
     pub file_offset: u64,
 }

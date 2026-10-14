@@ -129,7 +129,21 @@ fn is_framework(t: &str) -> bool {
     t.ends_with("constraint was violated") || FRAMEWORK.contains(&t)
 }
 
-/// The program's own messages, in address order. Empty when the program carries none.
+/// Whether the `&str` loaded at instruction `i` is handed to `sol_log_` shortly after, so the
+/// program logs it rather than raising it as an error. `msg!` compiles to `...; call sol_log_`.
+fn feeds_log(p: &Program, i: u32) -> bool {
+    let end = (i + 8).min(p.insns.len() as u32);
+    for k in i + 1..end {
+        if let crate::isa::Op::Call { .. } = p.insns[k as usize].op {
+            return matches!(p.call_target(k), crate::program::CallTarget::Syscall(n) if n.starts_with("sol_log"));
+        }
+    }
+    false
+}
+
+/// The program's own messages, in address order. Empty when the program carries none. Each is
+/// tagged `error` or `log`: a message handed to `sol_log_` at every site that loads it is a log,
+/// anything else (an Anchor error enum's `Display`, a panic) an error.
 pub fn recover(p: &Program, cfg: &Cfg, literals: &Literals) -> Vec<ProgramMessageFact> {
     // Which function each instruction belongs to.
     let mut func_of = vec![u32::MAX; cfg.block_of.len()];
@@ -141,26 +155,41 @@ pub fn recover(p: &Program, cfg: &Cfg, literals: &Literals) -> Vec<ProgramMessag
         }
     }
 
-    // Candidate error messages the code materialises as `&str`, by the function that loads them.
-    let mut by_func: BTreeMap<u32, BTreeMap<u64, String>> = BTreeMap::new();
+    // Candidate messages the code materialises as `&str`, by the function that loads them. For each,
+    // track whether every load site logs it (then it is a log, not an error).
+    struct Cand {
+        text: String,
+        logged_everywhere: bool,
+    }
+    let mut by_func: BTreeMap<u32, BTreeMap<u64, Cand>> = BTreeMap::new();
     for (&i, &addr) in &literals.code_slices {
         let Some(s) = literals.strings.get(&addr) else { continue };
         if !error_shaped(&s.text) || is_framework(&s.text) {
             continue;
         }
         let Some(&func) = func_of.get(i as usize).filter(|&&f| f != u32::MAX) else { continue };
-        by_func.entry(func).or_default().insert(addr, s.text.clone());
+        let logged = feeds_log(p, i);
+        by_func
+            .entry(func)
+            .or_default()
+            .entry(addr)
+            .and_modify(|c| c.logged_everywhere &= logged)
+            .or_insert(Cand { text: s.text.clone(), logged_everywhere: logged });
     }
 
     // An error enum's Display loads several of its messages in one function; a lone capitalised
-    // string elsewhere is more likely a logged status than an error variant.
-    let mut out: BTreeMap<u64, String> = BTreeMap::new();
-    for msgs in by_func.values() {
+    // string elsewhere is more likely an incidental log than an error variant.
+    let mut out: BTreeMap<u64, Cand> = BTreeMap::new();
+    for msgs in by_func.into_values() {
         if msgs.len() >= 2 {
-            out.extend(msgs.iter().map(|(&a, t)| (a, t.clone())));
+            out.extend(msgs);
         }
     }
     out.into_iter()
-        .map(|(addr, message)| ProgramMessageFact { message, file_offset: p.elf.file_offset_of(addr).unwrap_or(0) })
+        .map(|(addr, c)| ProgramMessageFact {
+            message: c.text,
+            kind: if c.logged_everywhere { "log" } else { "error" },
+            file_offset: p.elf.file_offset_of(addr).unwrap_or(0),
+        })
         .collect()
 }
