@@ -249,7 +249,7 @@ pub fn inspect(bytes: &[u8]) -> Result<Report, InspectError> {
         })
     };
     // The program's own Anchor error messages.
-    let program_messages = if anchor.detected { messages::recover(&p, &cfg, &literals) } else { Vec::new() };
+    let program_messages = messages::recover(&p, &cfg, &literals);
     let panic_locations = literals
         .locations
         .values()
