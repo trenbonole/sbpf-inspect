@@ -110,12 +110,39 @@ fn anchor_facts_are_observed() {
 }
 
 #[test]
+fn anchor_argument_layouts_follow_the_source() {
+    let r = load("inspect_fixture_anchor.so");
+    let layout = |name: &str| {
+        let ix = r.anchor.instructions.iter().find(|i| i.name == name).unwrap_or_else(|| panic!("{name} missing"));
+        ix.arguments.clone().unwrap_or_else(|| panic!("{name} has no layout"))
+    };
+    let fields = |name: &str| layout(name).fields.iter().map(|f| (f.offset, f.size)).collect::<Vec<_>>();
+    // initialize(fee_bps: u16), deposit_v2(amount: u64), step_2(), set_authority(new_authority: Pubkey)
+    assert_eq!(fields("initialize"), [(0, 2)]);
+    assert_eq!(fields("deposit_v2"), [(0, 8)]);
+    assert_eq!(fields("step_2"), []);
+    assert!(layout("step_2").complete, "an empty, complete layout means no arguments");
+    // The public key is moved in uneven pieces: the layout covers its 32 bytes and says it is uncertain.
+    let key = layout("set_authority");
+    assert_eq!(key.fixed_size, 32);
+    assert!(key.irregular || key.fields.iter().all(|f| f.copied));
+}
+
+#[test]
+fn panic_locations_name_source_files() {
+    let r = load("inspect_fixture_anchor.so");
+    assert!(!r.panic_locations.is_empty());
+    assert!(r.panic_locations.iter().all(|l| l.file.ends_with(".rs") && l.line > 0));
+}
+
+#[test]
 fn native_program_is_not_mistaken_for_anchor() {
     let r = load("inspect_fixture_native.so");
     assert!(!r.anchor.detected, "an `Instruction: Ping` log string alone is not Anchor");
     assert!(r.anchor.instructions.is_empty());
     assert_eq!(r.anchor.uncorroborated_instruction_logs.len(), 1);
     assert!(r.anchor.uncorroborated_instruction_logs[0].log_token.starts_with("Ping"));
+    assert!(r.native_dispatch.is_none(), "one logged instruction is not a dispatch of three or more");
 }
 
 #[test]

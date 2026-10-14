@@ -3,6 +3,8 @@
 // Instructions match by discriminator, computed from the name when a legacy IDL omits it. With the
 // program file, account lists are also graded leaving out IDL accounts whose names never occur in the
 // binary: the program cannot check those by name, so they are usually IDL-only additions.
+// Argument layouts are graded on each instruction's fixed-size prefix, with defined structs expanded
+// into their fields; the prefix ends at the first vector, string or option.
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 
@@ -65,5 +67,84 @@ for (const i of right) {
 }
 console.log(`account lists: ${lists} of ${right.length} instructions, ${exact} exact${binary ? `, ${backedExact} exact counting only accounts named in the binary` : ""}`);
 console.log(`  flags on ${n} accounts: writable ${w} agree (${wExtra} writable where the IDL says not), signer ${s} agree (${sExtra} signer where the IDL says not)`);
+// Argument layouts.
+const PRIM = { bool: 1, u8: 1, i8: 1, u16: 2, i16: 2, u32: 4, i32: 4, f32: 4, u64: 8, i64: 8, f64: 8, u128: 16, i128: 16, pubkey: 32, publicKey: 32 };
+const types = new Map((idl.types || []).map((t) => [t.name, t]));
+/** The fixed-size fields an argument list starts with, defined structs expanded, and whether that is all of it. */
+function expected(args) {
+  const fields = [];
+  let off = 0, complete = true;
+  const walk = (t, depth) => {
+    if (!complete || depth > 16) return void (complete = false);
+    if (typeof t === "string") {
+      if (PRIM[t] === undefined) return void (complete = false);
+      fields.push({ offset: off, size: PRIM[t], elem: PRIM[t] });
+      off += PRIM[t];
+      return;
+    }
+    if (t.array && typeof t.array[1] === "number") {
+      const [inner, n] = t.array;
+      if (typeof inner === "string" && PRIM[inner] !== undefined) {
+        fields.push({ offset: off, size: PRIM[inner] * n, elem: PRIM[inner] });
+        off += PRIM[inner] * n;
+        return;
+      }
+      for (let k = 0; k < n && complete; k++) walk(inner, depth + 1);
+      return;
+    }
+    const def = t.defined !== undefined ? types.get(typeof t.defined === "string" ? t.defined : t.defined.name) : null;
+    if (def?.type?.kind === "struct") {
+      for (const f of def.type.fields || []) if (complete) walk(f.type !== undefined ? f.type : f, depth + 1);
+      return;
+    }
+    if (def?.type?.kind === "enum" && (def.type.variants || []).every((v) => !v.fields || v.fields.length === 0)) {
+      fields.push({ offset: off, size: 1, elem: 1 });
+      off += 1;
+      return;
+    }
+    complete = false;
+  };
+  for (const a of args) if (complete) walk(a.type, 0);
+  return { fields, fixed: off, complete };
+}
+/** Points where a field may end or begin: field edges, and splits inside arrays (by element) and 16- or 32-byte values (by 8 bytes). */
+function points(exp, fixed) {
+  const pts = new Set([0, fixed]);
+  for (const e of exp) {
+    pts.add(e.offset);
+    pts.add(e.offset + e.size);
+    const step = e.elem < e.size ? e.elem : e.size === 16 || e.size === 32 ? 8 : e.size;
+    for (let p = e.offset + step; p < e.offset + e.size; p += step) pts.add(p);
+  }
+  return pts;
+}
+const A = { exact: 0, consistent: 0, read: 0, gradable: 0, none: 0, missing: 0, noArgs: 0, noArgsRight: 0, ungradable: 0 };
+for (const i of right) {
+  const want = truth.get(i.discriminator);
+  const e = expected(want.args || []);
+  const a = i.arguments;
+  if (e.fixed === 0 && !e.complete) { A.ungradable++; continue; }
+  if (e.fixed === 0) { A.noArgs++; if (a && a.fields.length === 0) A.noArgsRight++; continue; }
+  A.gradable++;
+  if (!a) { A.missing++; continue; }
+  if (a.fields.length === 0) { A.none++; continue; }
+  A.read++;
+  const pts = points(e.fields, e.fixed);
+  const inPrefix = a.fields.filter((f) => f.offset < e.fixed);
+  const consistent = inPrefix.every((f) => pts.has(f.offset) && (f.offset + f.size > e.fixed || pts.has(f.offset + f.size)));
+  const boundaries = new Set(inPrefix.map((f) => f.offset));
+  const exact = consistent && e.fields.every((f) => boundaries.has(f.offset)) && (e.complete ? a.fixed_size === e.fixed : a.fixed_size >= e.fixed);
+  if (consistent) A.consistent++;
+  if (exact) A.exact++;
+  if (verbose && !exact) {
+    const show = (fs) => fs.map((f) => `${f.offset}+${f.size}${f.copied ? "c" : ""}`).join(" ");
+    console.log(`  ${want.name} arguments
+    idl  : ${show(e.fields)}${e.complete ? "" : " ..."}
+    found: ${show(a.fields)}`);
+  }
+}
+console.log(`argument layouts: ${A.gradable} instructions with a fixed-size prefix: ${A.exact} exact, ${A.read - A.exact} not, ${A.none} with no reads found, ${A.missing} without a layout`);
+console.log(`  precision: ${A.consistent} of ${A.read} layouts put every field edge on a real field boundary`);
+console.log(`  no arguments: ${A.noArgsRight} of ${A.noArgs} have an empty layout; ${A.ungradable} start with a variable-size argument and are not graded`);
 console.log(`referenced (called, not implemented): ${r.anchor.instructions.filter((i) => i.status === "referenced").map((i) => i.name).join(", ") || "none"}`);
 console.log(`sbpf ${r.elf.sbpf_version}, ${r.syscalls.length} named calls, ${r.constants.lddw + r.constants.mov32_hor64} 64-bit immediates, diagnostics ${r.diagnostics.length}`);

@@ -11,6 +11,10 @@
 //! first, then candidate names are hashed and kept only on a hit. That lets the
 //! engine try every substring of every identifier-like run, which is what
 //! names packed against other literals or against binary bytes need.
+//!
+//! Instruction names are also tried under the SPL interface namespaces Anchor programs implement
+//! (transfer hook, token metadata, token group), and every search that grows with the input has a
+//! cap, reported in `limits_hit` when reached.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -23,6 +27,22 @@ use crate::{
         RecoveredInstruction, RecoveredType, UncorroboratedLog,
     },
 };
+
+/// Hash namespaces an instruction handler can be dispatched under: Anchor's own, and the SPL
+/// interfaces Anchor programs implement with custom discriminators. The function turns the
+/// snake_case handler name into the spelling that interface hashes.
+const INSTRUCTION_NAMESPACES: &[(&str, fn(&str) -> String)] = &[
+    ("global", |s| s.to_string()),
+    ("spl-transfer-hook-interface", |s| s.replace('_', "-")),
+    ("spl_token_metadata_interface", |s| s.to_string()),
+    ("spl_token_group_interface", |s| s.to_string()),
+];
+/// Most data bytes indexed for 8-byte lookups.
+const MAX_INDEXED_DATA: usize = 32 << 20;
+/// Most distinct identifier runs considered for account and event names.
+const MAX_RUNS: usize = 100_000;
+/// Most account/event name candidates hashed.
+const MAX_TYPE_CANDIDATES: usize = 2_000_000;
 
 const INSTRUCTION_LOG_PREFIX: &[u8] = b"Instruction: ";
 const ANCHOR_ERROR: &[u8] = b"AnchorError";
@@ -192,8 +212,11 @@ impl<'a> Haystack<'a> {
         for c in constants {
             values.insert(c.value.to_le_bytes());
         }
+        let mut budget = MAX_INDEXED_DATA;
         for s in sections {
-            for w in s.data.windows(8) {
+            let take = s.data.len().min(budget);
+            budget -= take;
+            for w in s.data[..take].windows(8) {
                 let mut key = [0u8; 8];
                 key.copy_from_slice(w);
                 values.insert(key);
@@ -244,6 +267,9 @@ fn identifier_runs<'s>(sections: &'s [DataSection]) -> Vec<&'s str> {
                 i += 1;
             }
             let run = &s.data[start..i];
+            if runs.len() >= MAX_RUNS {
+                return runs;
+            }
             if run.len() >= 2 && run.len() <= MAX_TOKEN && seen.insert(run) {
                 // Identifier bytes are ASCII, so this cannot fail.
                 if let Ok(text) = std::str::from_utf8(run) {
@@ -279,6 +305,13 @@ fn type_candidates(run: &str, out: &mut HashSet<String>) {
     }
 }
 
+/// Where each of these 8-byte discriminators is in the program (empty when absent), for checking a
+/// published interface against the binary.
+pub fn locate_all(constants: &[Constant], chains: &ByteCompares, sections: &[DataSection], keys: &[[u8; 8]]) -> Vec<Vec<Evidence>> {
+    let mut haystack = Haystack::new(constants, sections, chains);
+    keys.iter().map(|k| haystack.find_instruction(*k).unwrap_or_default()).collect()
+}
+
 /// Recover Anchor instruction, account and event names from one program.
 pub fn analyze(constants: &[Constant], chains: &ByteCompares, sections: &[DataSection]) -> AnchorFacts {
     let mut haystack = Haystack::new(constants, sections, chains);
@@ -310,23 +343,25 @@ pub fn analyze(constants: &[Constant], chains: &ByteCompares, sections: &[DataSe
     let mut primary: HashSet<String> = HashSet::new();
     let mut uncorroborated = Vec::new();
     for log in &logs {
-        let mut corroborated: Vec<(String, String, [u8; 8], Vec<Evidence>)> = Vec::new();
+        let mut corroborated: Vec<(String, String, [u8; 8], Vec<Evidence>, &'static str)> = Vec::new();
         for end in 1..=log.token.len() {
             let prefix = &log.token[..end];
             if !prefix.as_bytes()[0].is_ascii_alphabetic() {
                 break;
             }
             for snake in snake_variants(prefix) {
-                let key = discriminator("global", &snake);
-                if let Some(evidence) = haystack.find_instruction(key) {
-                    corroborated.push((snake, prefix.to_string(), key, evidence));
+                for (namespace, spelling) in INSTRUCTION_NAMESPACES {
+                    let key = discriminator(namespace, &spelling(&snake));
+                    if let Some(evidence) = haystack.find_instruction(key) {
+                        corroborated.push((snake.clone(), prefix.to_string(), key, evidence, *namespace));
+                    }
                 }
             }
         }
         // A token that starts with an IDL-management name is Anchor's own
         // instruction, unless a longer user name is corroborated
         // (a handler called `idl_writer` logs `IdlWriter`).
-        let longest_user = corroborated.iter().map(|(_, prefix, _, _)| prefix.len()).max().unwrap_or(0);
+        let longest_user = corroborated.iter().map(|(_, prefix, _, _, _)| prefix.len()).max().unwrap_or(0);
         if let Some(fw) = IDL_INSTRUCTIONS.iter().find(|n| log.token.starts_with(**n) && longest_user <= n.len()) {
             let snake = snake_variants(fw).remove(0);
             instructions
@@ -334,12 +369,14 @@ pub fn analyze(constants: &[Constant], chains: &ByteCompares, sections: &[DataSe
                 .or_insert_with(|| RecoveredInstruction {
                     name: snake,
                     log_name: (*fw).to_string(),
+                    namespace: "anchor-idl".to_string(),
                     discriminator: None,
                     status: InstructionStatus::Framework,
                     log_string_offsets: Vec::new(),
                     discriminator_evidence: Vec::new(),
                     accounts_check_offset: None,
                     accounts: None,
+                    arguments: None,
                 })
                 .log_string_offsets
                 .push(log.file_offset);
@@ -348,13 +385,14 @@ pub fn analyze(constants: &[Constant], chains: &ByteCompares, sections: &[DataSe
         if corroborated.is_empty() {
             uncorroborated.push(UncorroboratedLog { log_token: log.token.clone(), file_offset: log.file_offset });
         }
-        if let Some((snake, _, _, _)) = corroborated.iter().max_by_key(|(_, prefix, _, _)| prefix.len()) {
+        if let Some((snake, _, _, _, _)) = corroborated.iter().max_by_key(|(_, prefix, _, _, _)| prefix.len()) {
             primary.insert(snake.clone());
         }
-        for (snake, prefix, key, evidence) in corroborated {
+        for (snake, prefix, key, evidence, namespace) in corroborated {
             let entry = instructions.entry(snake.clone()).or_insert_with(|| RecoveredInstruction {
                 name: snake,
                 log_name: prefix,
+                namespace: namespace.to_string(),
                 discriminator: Some(hex(&key)),
                 // Settled below, once every log string has been seen.
                 status: InstructionStatus::Implemented,
@@ -362,6 +400,7 @@ pub fn analyze(constants: &[Constant], chains: &ByteCompares, sections: &[DataSe
                 discriminator_evidence: evidence,
                 accounts_check_offset: None,
                 accounts: None,
+                arguments: None,
             });
             if !entry.log_string_offsets.contains(&log.file_offset) {
                 entry.log_string_offsets.push(log.file_offset);
@@ -390,8 +429,17 @@ pub fn analyze(constants: &[Constant], chains: &ByteCompares, sections: &[DataSe
     }
 
     // 3. Accounts and events.
+    let mut limits_hit = Vec::new();
     let mut candidates = HashSet::new();
-    for run in identifier_runs(sections) {
+    let runs = identifier_runs(sections);
+    if runs.len() >= MAX_RUNS {
+        limits_hit.push(format!("only the first {MAX_RUNS} identifier runs were searched for account and event names"));
+    }
+    for run in runs {
+        if candidates.len() >= MAX_TYPE_CANDIDATES {
+            limits_hit.push(format!("account and event name search stopped at {MAX_TYPE_CANDIDATES} candidates"));
+            break;
+        }
         type_candidates(run, &mut candidates);
     }
     let mut accounts = BTreeMap::new();
@@ -450,7 +498,9 @@ pub fn analyze(constants: &[Constant], chains: &ByteCompares, sections: &[DataSe
 
     // Log strings alone are a weak signal: any program can log `Instruction: X`.
     // Detection needs a corroborated instruction, the IDL tag or Anchor's error strings.
-    let detected = instructions.values().any(|i| i.status == InstructionStatus::Implemented)
+    // Only Anchor's own namespace counts: SPL interface instructions are implemented by
+    // non-Anchor programs too (Token-2022 implements token-metadata and token-group).
+    let detected = instructions.values().any(|i| i.status == InstructionStatus::Implemented && i.namespace == "global")
         || markers.iter().filter(|m| m.name != "instruction_log_strings").any(|m| !m.evidence.is_empty());
 
     AnchorFacts {
@@ -460,6 +510,7 @@ pub fn analyze(constants: &[Constant], chains: &ByteCompares, sections: &[DataSe
         uncorroborated_instruction_logs: uncorroborated,
         accounts: accounts.into_values().collect(),
         events: events.into_values().collect(),
+        limits_hit,
     }
 }
 
@@ -524,7 +575,7 @@ mod tests {
     #[test]
     fn shorter_prefix_without_its_own_log_is_referenced() {
         // `burn` is only a prefix of `BurnStranded`: a call target, not a handler.
-        let mut data = b"Instruction: BurnStranded ".to_vec();
+        let mut data = b"Instruction: BurnStranded\0".to_vec();
         data.extend_from_slice(&discriminator("global", "burn_stranded"));
         data.extend_from_slice(&discriminator("global", "burn"));
         let facts = analyze(&[], &ByteCompares::default(), &[DataSection { file_offset: 0, data: &data }]);

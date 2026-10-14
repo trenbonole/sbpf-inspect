@@ -23,14 +23,21 @@
 //!
 //! Everything here is inferred from code shape. Names come only from the
 //! binary, so an account whose name the program never embeds is not listed.
+//!
+//! It reads the loaded [`Program`] (text, read-only data, relocation-resolved call names), and its
+//! graph searches share a step budget so a crafted binary cannot make it run unbounded.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     rc::Rc,
 };
 
 use crate::report::{AccountPosition, RecoveredAccount};
+use crate::program::{CallTarget, Program};
+
+/// Total graph-search steps for one program before account recovery gives up.
+const STEP_BUDGET: u64 = 200_000_000;
 
 const OP_LDDW: u8 = 0x18;
 const OP_ADD64_IMM: u8 = 0x07;
@@ -69,85 +76,8 @@ struct Insn {
     file_offset: u64,
 }
 
-struct Section {
-    name: String,
-    kind: u32,
-    addr: u64,
-    offset: u64,
-    size: u64,
-}
-
-fn u16_at(b: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?))
-}
 fn u32_at(b: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
-}
-fn u64_at(b: &[u8], at: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?))
-}
-
-fn section_headers(b: &[u8]) -> Option<Vec<Section>> {
-    let shoff = usize::try_from(u64_at(b, 0x28)?).ok()?;
-    let entsize = usize::from(u16_at(b, 0x3a)?);
-    let count = usize::from(u16_at(b, 0x3c)?);
-    let strndx = usize::from(u16_at(b, 0x3e)?);
-    let mut out = Vec::with_capacity(count);
-    let mut name_offsets = Vec::with_capacity(count);
-    for i in 0..count {
-        let o = shoff.checked_add(i.checked_mul(entsize)?)?;
-        name_offsets.push(u32_at(b, o)?);
-        out.push(Section {
-            name: String::new(),
-            kind: u32_at(b, o + 4)?,
-            addr: u64_at(b, o + 16)?,
-            offset: u64_at(b, o + 24)?,
-            size: u64_at(b, o + 32)?,
-        });
-    }
-    let strtab = usize::try_from(out.get(strndx)?.offset).ok()?;
-    for (s, name_off) in out.iter_mut().zip(name_offsets) {
-        s.name = c_string(b, strtab.checked_add(name_off as usize)?);
-    }
-    Some(out)
-}
-
-fn c_string(b: &[u8], at: usize) -> String {
-    b.get(at..).unwrap_or(&[]).iter().take_while(|&&c| c != 0).map(|&c| c as char).collect()
-}
-
-fn section_bytes<'a>(b: &'a [u8], s: &Section) -> &'a [u8] {
-    let start = usize::try_from(s.offset).unwrap_or(usize::MAX).min(b.len());
-    let end = start.saturating_add(usize::try_from(s.size).unwrap_or(usize::MAX)).min(b.len());
-    &b[start..end]
-}
-
-/// murmur3 32-bit with seed 0: sBPF v3 encodes a syscall as `call` with src 0 and this hash of its name.
-pub fn murmur3(data: &[u8]) -> u32 {
-    const C1: u32 = 0xcc9e_2d51;
-    const C2: u32 = 0x1b87_3593;
-    let mut h: u32 = 0;
-    let mut chunks = data.chunks_exact(4);
-    for c in &mut chunks {
-        let mut k = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-        k = k.wrapping_mul(C1).rotate_left(15).wrapping_mul(C2);
-        h ^= k;
-        h = h.rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64);
-    }
-    let rest = chunks.remainder();
-    if !rest.is_empty() {
-        let mut k: u32 = 0;
-        for (i, &byte) in rest.iter().enumerate() {
-            k ^= u32::from(byte) << (8 * i);
-        }
-        h ^= k.wrapping_mul(C1).rotate_left(15).wrapping_mul(C2);
-    }
-    h ^= data.len() as u32;
-    h ^= h >> 16;
-    h = h.wrapping_mul(0x85eb_ca6b);
-    h ^= h >> 13;
-    h = h.wrapping_mul(0xc2b2_ae35);
-    h ^ (h >> 16)
+    Some(u32::from_le_bytes(b.get(at..at.checked_add(4)?)?.try_into().ok()?))
 }
 
 fn is_ident(s: &str) -> bool {
@@ -268,37 +198,47 @@ struct Analyzer<'a> {
     raises_cache: RefCell<HashMap<(i64, i32, u32), bool>>,
     reads_cache: RefCell<HashMap<(i64, u8, u32), bool>>,
     recovered: RefCell<HashMap<i64, Rc<Vec<RecoveredAccount>>>>,
+    steps: Cell<u64>,
+    exhausted: Cell<bool>,
 }
 
 impl<'a> Analyzer<'a> {
-    fn new(b: &'a [u8]) -> Option<Self> {
-        let sections = section_headers(b)?;
-        let text = sections.iter().find(|s| s.name == ".text")?;
-        let rodata = sections.iter().find(|s| s.name == ".rodata").map(|s| (s.addr, section_bytes(b, s)));
-        let version = u32_at(b, 48)?;
-        let text_start = usize::try_from(text.offset).ok()?;
-        let text_end = text_start.checked_add(usize::try_from(text.size).ok()?)?;
+    /// Count `n` search steps; false once the budget is spent.
+    fn tick(&self, n: u64) -> bool {
+        let s = self.steps.get().saturating_add(n);
+        self.steps.set(s);
+        if s > STEP_BUDGET {
+            self.exhausted.set(true);
+            return false;
+        }
+        true
+    }
+
+    fn new(p: &'a Program<'a>) -> Option<Self> {
+        let rodata = p.data.iter().find(|r| r.name == ".rodata").or_else(|| p.data.first()).map(|r| (r.vaddr, r.bytes));
+        let version = p.version;
+        let b = p.text;
 
         let mut ins = Vec::new();
         let mut slot_index = Vec::new();
-        let (mut p, mut pc) = (text_start, 0i64);
-        while p + 8 <= text_end && p + 8 <= b.len() {
-            let op = b[p];
-            let regs = b[p + 1];
-            let off = i16::from_le_bytes([b[p + 2], b[p + 3]]);
-            let imm = i32::from_le_bytes([b[p + 4], b[p + 5], b[p + 6], b[p + 7]]);
-            let mut x = Insn { pc, op, dst: regs & 15, src: regs >> 4, off, imm, imm64: 0, file_offset: p as u64 };
+        let (mut q, mut pc) = (0usize, 0i64);
+        while q + 8 <= b.len() {
+            let op = b[q];
+            let regs = b[q + 1];
+            let off = i16::from_le_bytes([b[q + 2], b[q + 3]]);
+            let imm = i32::from_le_bytes([b[q + 4], b[q + 5], b[q + 6], b[q + 7]]);
+            let mut x = Insn { pc, op, dst: regs & 15, src: regs >> 4, off, imm, imm64: 0, file_offset: p.text_file_offset + q as u64 };
             slot_index.push(ins.len());
             if op == OP_LDDW {
-                let hi = u32_at(b, p + 12).unwrap_or(0);
+                let hi = u32_at(b, q + 12).unwrap_or(0);
                 x.imm64 = (u64::from(hi) << 32) | u64::from(imm as u32);
                 ins.push(x);
                 slot_index.push(usize::MAX);
-                p += 16;
+                q += 16;
                 pc += 2;
             } else {
                 ins.push(x);
-                p += 8;
+                q += 8;
                 pc += 1;
             }
         }
@@ -306,33 +246,19 @@ impl<'a> Analyzer<'a> {
             return None;
         }
 
-        // Syscall names: relocations against .dynsym on v0/v1, hashed names on v3.
+        // Call names from the loader's relocation replay (v0-v2) and syscall hashes (v3). A relocated call
+        // to a defined function keeps its symbol name (e.g. custom_panic).
         let mut syscall_names = HashMap::new();
-        let rel = sections.iter().find(|s| s.kind == 9 && s.name == ".rel.dyn");
-        let dynsym = sections.iter().find(|s| s.kind == 11);
-        let dynstr = sections.iter().find(|s| s.name == ".dynstr");
-        if let (Some(rel), Some(dynsym), Some(dynstr)) = (rel, dynsym, dynstr) {
-            let rel_bytes = section_bytes(b, rel);
-            for entry in rel_bytes.chunks_exact(16) {
-                let at = u64::from_le_bytes(entry[0..8].try_into().ok()?);
-                let sym = (u64::from_le_bytes(entry[8..16].try_into().ok()?) >> 32) as usize;
-                if sym == 0 || at < text.addr || at >= text.addr.saturating_add(text.size) || (at - text.addr) % 8 != 0 {
-                    continue;
-                }
-                let name_off = dynsym.offset as usize + sym * 24;
-                let Some(name_idx) = u32_at(b, name_off) else { continue };
-                let name = c_string(b, dynstr.offset as usize + name_idx as usize);
-                if !name.is_empty() {
-                    syscall_names.insert(((at - text.addr) / 8) as i64, name);
-                }
-            }
-        }
-        let hashed: HashMap<u32, &str> = ["abort", "sol_panic_"].iter().map(|n| (murmur3(n.as_bytes()), *n)).collect();
-        for x in &ins {
-            if x.op == OP_CALL && x.src == 0 {
-                if let Some(n) = hashed.get(&(x.imm as u32)) {
-                    syscall_names.insert(x.pc, n.to_string());
-                }
+        for (i, target) in &p.calls {
+            let Some(x) = p.insns.get(*i as usize) else { continue };
+            let name = match target {
+                CallTarget::Syscall(n) => Some(n.to_string()),
+                CallTarget::Import(n) => Some(n.clone()),
+                CallTarget::Internal(t) => p.symbols.get(t).cloned(),
+                _ => None,
+            };
+            if let Some(n) = name {
+                syscall_names.insert(i64::from(x.pc), n);
             }
         }
 
@@ -355,14 +281,16 @@ impl<'a> Analyzer<'a> {
             raises_cache: RefCell::default(),
             reads_cache: RefCell::default(),
             recovered: RefCell::default(),
+            steps: Cell::new(0),
+            exhausted: Cell::new(false),
         };
         *a.name_cache.borrow_mut() = vec![None; a.ins.len()];
 
         // Function starts: the entrypoint and every internal call target.
         let mut starts = BTreeSet::new();
-        let entry = u64_at(b, 0x18)?;
-        if entry >= text.addr && (entry - text.addr) % 8 == 0 {
-            starts.insert(((entry - text.addr) / 8) as i64);
+        let entry = p.elf.e_entry;
+        if entry >= p.text_vaddr && (entry - p.text_vaddr) % 8 == 0 {
+            starts.insert(((entry - p.text_vaddr) / 8) as i64);
         }
         for x in &a.ins {
             if a.is_call(x) {
@@ -777,7 +705,7 @@ impl<'a> Analyzer<'a> {
         let mut out = Vec::new();
         let mut seen = HashSet::from([i]);
         let mut frontier = vec![i];
-        while !frontier.is_empty() && seen.len() < 5000 {
+        while !frontier.is_empty() && seen.len() < 5000 && self.tick(frontier.len() as u64) {
             let mut next = Vec::new();
             for &k in &frontier {
                 let z = self.ins[k];
@@ -819,6 +747,9 @@ impl<'a> Analyzer<'a> {
         inn[0] = Some(start);
         let mut work = vec![i0];
         while let Some(i) = work.pop() {
+            if !self.tick(1) {
+                break;
+            }
             let z = self.ins[i];
             let Some(mut s) = inn[i - i0].clone() else { continue };
             let class = z.op & 7;
@@ -980,7 +911,7 @@ impl<'a> Analyzer<'a> {
             let mut frontier = vec![i + 1];
             let mut hit = None;
             for _ in 0..120 {
-                if frontier.is_empty() || hit.is_some() {
+                if frontier.is_empty() || hit.is_some() || !self.tick(frontier.len() as u64) {
                     break;
                 }
                 let mut next = Vec::new();
@@ -1077,7 +1008,7 @@ impl<'a> Analyzer<'a> {
             let mut frontier = vec![start];
             let mut hit: Option<Rc<str>> = None;
             for _ in 0..200 {
-                if frontier.is_empty() || hit.is_some() {
+                if frontier.is_empty() || hit.is_some() || !self.tick(frontier.len() as u64) {
                     break;
                 }
                 let mut next = Vec::new();
@@ -1243,10 +1174,14 @@ impl<'a> Analyzer<'a> {
 
 /// Account lists keyed by the name in each `Instruction: <Name>` log string the code loads.
 /// `None` when that instruction's accounts check could not be located.
-pub fn recover(bytes: &[u8]) -> BTreeMap<String, Option<AccountsCheck>> {
+/// Also returns whether the step budget ran out.
+pub fn recover(p: &Program) -> (BTreeMap<String, Option<AccountsCheck>>, bool) {
     let mut out: BTreeMap<String, Option<AccountsCheck>> = BTreeMap::new();
-    let Some(a) = Analyzer::new(bytes) else { return out };
+    let Some(a) = Analyzer::new(p) else { return (out, false) };
     for li in 0..a.ins.len() {
+        if a.exhausted.get() {
+            break;
+        }
         let Some(log) = a.rodata_slice(li) else { continue };
         let Some(name) = log.strip_prefix(LOG_PREFIX) else { continue };
         let located = a.accounts_check(li).map(|t| AccountsCheck {
@@ -1262,19 +1197,13 @@ pub fn recover(bytes: &[u8]) -> BTreeMap<String, Option<AccountsCheck>> {
             }
         }
     }
-    out
+    let exhausted = a.exhausted.get();
+    (out, exhausted)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn murmur3_matches_solana_syscall_hashes() {
-        // The hashes sBPF v3 programs carry for these syscalls.
-        assert_eq!(murmur3(b"abort"), 0xb6fc_1a11);
-        assert_eq!(murmur3(b"sol_log_"), 0x2075_59bd);
-    }
 
     fn insn(pc: i64, op: u8, dst: u8, src: u8, off: i16, imm: i32) -> Insn {
         Insn { pc, op, dst, src, off, imm, imm64: 0, file_offset: pc as u64 * 8 }
@@ -1301,6 +1230,8 @@ mod tests {
             raises_cache: RefCell::default(),
             reads_cache: RefCell::default(),
             recovered: RefCell::default(),
+            steps: Cell::new(0),
+            exhausted: Cell::new(false),
         }
     }
 

@@ -15,7 +15,15 @@ pub struct Report {
     pub syscalls: Vec<SyscallUse>,
     pub constants: ConstantCoverage,
     pub strings: Vec<StringFact>,
+    /// Source locations of panics the compiler kept (Rust's `core::panic::Location`).
+    pub panic_locations: Vec<PanicLocationFact>,
+    /// An embedded security.txt (solana-security-txt), as field and value pairs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_txt: Option<Vec<SecurityTxtField>>,
     pub anchor: AnchorFacts,
+    /// The `match instruction_data[0]` dispatch of a native (non-Anchor) program, when one is found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_dispatch: Option<NativeDispatch>,
     pub unknowns: Vec<String>,
     /// Non-fatal problems met while parsing; analysis continued past them.
     pub diagnostics: Vec<String>,
@@ -90,6 +98,49 @@ pub struct StringFact {
 }
 
 #[derive(Debug, Serialize)]
+pub struct PanicLocationFact {
+    pub file: String,
+    pub line: u32,
+    pub col: u32,
+    /// File offset of the `Location` value.
+    pub file_offset: u64,
+    /// File offsets of the instructions that load it.
+    pub referenced_by: Vec<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SecurityTxtField {
+    pub field: String,
+    pub value: String,
+}
+
+/// A native program's instruction dispatch: which tag values reach which code.
+#[derive(Debug, Serialize)]
+pub struct NativeDispatch {
+    /// File offset of the load of the tag the dispatch switches on.
+    pub tag_load_offset: u64,
+    /// Width of the tag in bytes (1 for a byte tag, 4 for bincode's u32).
+    pub tag_width: u32,
+    /// At least three handlers log distinct `Instruction: <Name>` names, so this switch is the
+    /// instruction dispatch. When false, the switch found may be another one.
+    pub confirmed: bool,
+    pub handlers: Vec<NativeHandler>,
+    /// Tag values that reach code shared by many values (usually "invalid instruction").
+    pub other_tags: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NativeHandler {
+    /// The tag values that reach this code.
+    pub tags: Vec<u8>,
+    /// File offset where the handler's code starts.
+    pub file_offset: u64,
+    /// The first `Instruction: <Name>` log the handler reaches, when it logs one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct AnchorFacts {
     /// True when a corroborated instruction, the IDL instruction tag or Anchor's
     /// error strings were found. Instruction log strings alone do not count.
@@ -100,6 +151,8 @@ pub struct AnchorFacts {
     pub uncorroborated_instruction_logs: Vec<UncorroboratedLog>,
     pub accounts: Vec<RecoveredType>,
     pub events: Vec<RecoveredType>,
+    /// Caps that were reached; results may be incomplete.
+    pub limits_hit: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,7 +206,10 @@ pub struct RecoveredInstruction {
     pub name: String,
     /// The name as it appears in the program's log string.
     pub log_name: String,
-    /// `sha256("global:" + name)[..8]`, hex. Absent for framework instructions,
+    /// The hash namespace the discriminator matched: `global` for Anchor handlers, or an SPL
+    /// interface namespace such as `spl-transfer-hook-interface`.
+    pub namespace: String,
+    /// `sha256(namespace + ":" + name)[..8]`, hex. Absent for framework instructions,
     /// which Anchor dispatches through its IDL instruction tag instead.
     pub discriminator: Option<String>,
     /// Whether this program handles the instruction, only references it, or is
@@ -171,6 +227,44 @@ pub struct RecoveredInstruction {
     /// Absent when the check could not be located.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accounts: Option<Vec<RecoveredAccount>>,
+    /// The byte layout of the instruction's arguments, from the reads its code path makes from the
+    /// instruction data. Absent when no walk through its dispatch could be made.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<ArgumentLayout>,
+}
+
+/// Where an instruction's code reads its arguments, after the 8-byte discriminator.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ArgumentLayout {
+    /// Fields in order. Empty when the code path reads nothing past the discriminator, which
+    /// usually means the instruction takes no arguments.
+    pub fields: Vec<ArgumentField>,
+    /// Bytes from the end of the discriminator to the end of the last field read. A variable-length
+    /// value (a vector, string or option) ends the layout.
+    pub fixed_size: u32,
+    /// Reads overlap or leave gaps, so the layout is uncertain.
+    pub irregular: bool,
+    /// The walk followed the instruction data everywhere it went. When false, the data reached a
+    /// call the walk does not enter, memory outside the stack, or a copy of unknown length, so
+    /// fields may be missing, and an empty layout does not mean the instruction takes none.
+    pub complete: bool,
+    /// File offset of the place the dispatch tests this discriminator, on the path that was walked,
+    /// or of the entry of the function that does when the start had to be guessed.
+    pub dispatch_offset: u64,
+    /// The walk ran out of steps, so fields may be missing.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ArgumentField {
+    /// Offset after the discriminator.
+    pub offset: u32,
+    pub size: u32,
+    /// The code only moved these bytes on the walked path and never computed with them, so the
+    /// field's bounds are those of the copy: a copied span can hold several fields (two public keys,
+    /// say), and a copied piece can be part of a larger one.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub copied: bool,
 }
 
 /// One account of an instruction, as its accounts check loads and checks it.
