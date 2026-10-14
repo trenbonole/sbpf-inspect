@@ -268,6 +268,11 @@ binary, which is rare. See [Limits](#limits).
   UpdateField). They do not count as Anchor detection
 - for native programs, the instruction dispatch: tag values, handler offsets,
   and handler names from their logs
+- the human-readable messages the program itself carries: its Anchor error
+  messages, `msg!` logs and warnings, with the framework's and runtime's own
+  removed. The text is in the binary even when the identifiers are not, and it
+  often says what an instruction's arguments mean (`"Name is empty or longer
+  than 32 characters"`)
 - instructions found by their 8-byte discriminator alone, when the binary does
   not hold their names: Anchor instructions that are not logged, and native
   programs' own 8-byte tags, shown as text when they are ASCII. Each comes with

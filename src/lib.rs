@@ -15,6 +15,7 @@ pub mod constants;
 pub mod dispatch;
 pub mod elf;
 pub mod emu;
+pub mod messages;
 pub mod isa;
 pub mod literals;
 pub mod program;
@@ -91,7 +92,7 @@ const UNKNOWNS: &[&str] = &[
     "Account names are recovered only when the name itself appears in the program's strings. A recovered account type can belong to another program this one validates, such as pump AMM's Pool inside pump.fun's bonding-curve program.",
     "Account lists are recovered only for Anchor instructions whose accounts check (try_accounts) can be located, and list only accounts whose names the binary embeds. An account positioned `matched` or `appended` was named only by later checks, so its position is weaker evidence. Of the constraints, only mut and signer are reported.",
     "Argument layouts are byte offsets and sizes read on the instruction's code path: names and types are not in the binary, a 1-byte field may be a u8 or a bool, and a variable-length value (vector, string, option) ends the layout.",
-    "Error codes defined by the program are not recovered.",
+    "Program messages (program_messages) are the error, log and warning strings the program itself carries, with the framework's and runtime's removed; an error is not told from a log, and an error enum whose Display reads its messages from a read-only table rather than loading each inline is not covered.",
     "Deployment identity, upgrade authority, verified-build status and runtime behaviour are unknown: the analysis is offline, and the only code it runs is the entrypoint's decoding of a made-up input with no accounts, to find where the instruction data goes.",
 ];
 
@@ -247,6 +248,8 @@ pub fn inspect(bytes: &[u8]) -> Result<Report, InspectError> {
             }
         })
     };
+    // The program's own Anchor error messages.
+    let program_messages = if anchor.detected { messages::recover(&p, &cfg, &literals) } else { Vec::new() };
     let panic_locations = literals
         .locations
         .values()
@@ -301,6 +304,7 @@ pub fn inspect(bytes: &[u8]) -> Result<Report, InspectError> {
         anchor,
         native_dispatch,
         unnamed_instructions,
+        program_messages,
         unknowns: UNKNOWNS.iter().map(|s| s.to_string()).collect(),
         diagnostics,
     })

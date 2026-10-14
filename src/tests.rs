@@ -355,6 +355,42 @@ fn unnamed_tags_are_confirmed_on_the_instruction_data() {
     assert_eq!(r.unnamed_instructions[0].discriminator, "5441474f4e453031");
 }
 
+#[test]
+fn program_messages_keep_the_programs_own_and_drop_the_frameworks() {
+    // rodata holds two program messages, one anchor-lang message, and a format fragment. One
+    // function loads all four as `&str` (lddw addr; mov r3, len). Only the program's two come back.
+    let m0 = "Launches are paused";
+    let m1 = "Name is empty or longer than 32 characters";
+    let fw = "A mut constraint was violated";
+    let frag = "left: ";
+    let mut ro = Vec::new();
+    let at = |ro: &Vec<u8>, _s: &str| ro.len();
+    let o0 = at(&ro, m0);
+    ro.extend_from_slice(m0.as_bytes());
+    let o1 = ro.len();
+    ro.extend_from_slice(m1.as_bytes());
+    let o2 = ro.len();
+    ro.extend_from_slice(fw.as_bytes());
+    let o3 = ro.len();
+    ro.extend_from_slice(frag.as_bytes());
+    let mut b = Builder { version: 0, rodata: ro, entry: 0, ..Default::default() };
+    let base = b.rodata_addr_for_text_len(13 * 8);
+    let load = |off: usize, len: usize| [lddw(2, base + off as u64).to_vec(), ins(0xb7, 3, 0, 0, len as i32).to_vec()].concat();
+    let mut text: Vec<Vec<u8>> = Vec::new();
+    for (o, s) in [(o0, m0), (o1, m1), (o2, fw), (o3, frag)] {
+        text.push(load(o, s.len()));
+    }
+    text.push(ins(0x95, 0, 0, 0, 0).to_vec()); // exit
+    let refs: Vec<&[u8]> = text.iter().map(Vec::as_slice).collect();
+    b = b.text(&refs);
+    let elf = b.build();
+    let p = Program::load(&elf).unwrap();
+    let cfg = Cfg::build(&p);
+    let lits = crate::literals::recover(&p);
+    let msgs: Vec<String> = crate::messages::recover(&p, &cfg, &lits).into_iter().map(|m| m.message).collect();
+    assert_eq!(msgs, vec![m0.to_string(), m1.to_string()], "program messages only, framework and fragments dropped");
+}
+
 /// xorshift64*: deterministic, so a failure reproduces.
 struct Rng(u64);
 impl Rng {

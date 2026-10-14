@@ -28,6 +28,11 @@ pub struct Report {
     /// bytes of its instruction data with these values, but no name for them was recovered.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unnamed_instructions: Vec<UnnamedInstruction>,
+    /// Human-readable messages the program itself carries: its Anchor error messages, `msg!` logs
+    /// and warnings, with the framework and runtime's own messages removed. Useful for reading the
+    /// program's intent; this does not separate an error from a log.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub program_messages: Vec<ProgramMessageFact>,
     pub unknowns: Vec<String>,
     /// Non-fatal problems met while parsing; analysis continued past them.
     pub diagnostics: Vec<String>,
@@ -134,6 +139,14 @@ pub struct UnnamedInstruction {
     /// The byte layout of the arguments after the discriminator, as for named instructions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<ArgumentLayout>,
+}
+
+/// One human-readable message the program carries (an error message, log or warning).
+#[derive(Debug, Serialize)]
+pub struct ProgramMessageFact {
+    pub message: String,
+    /// File offset of the message string.
+    pub file_offset: u64,
 }
 
 /// A native program's instruction dispatch: which tag values reach which code.
