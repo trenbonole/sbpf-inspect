@@ -37,6 +37,23 @@ const INSTRUCTION_NAMESPACES: &[(&str, fn(&str) -> String)] = &[
     ("spl_token_metadata_interface", |s| s.to_string()),
     ("spl_token_group_interface", |s| s.to_string()),
 ];
+/// The SPL interfaces' instructions, as (namespace, hash input). Several hash inputs are not the
+/// instruction's name (`updating_field` for UpdateField), and programs rarely log them, so they
+/// are named from this list when their discriminator is in the binary.
+const INTERFACE_INSTRUCTIONS: &[(&str, &str)] = &[
+    ("spl_token_metadata_interface", "initialize_account"),
+    ("spl_token_metadata_interface", "updating_field"),
+    ("spl_token_metadata_interface", "remove_key_ix"),
+    ("spl_token_metadata_interface", "update_the_authority"),
+    ("spl_token_metadata_interface", "emitter"),
+    ("spl_token_group_interface", "initialize_token_group"),
+    ("spl_token_group_interface", "update_group_max_size"),
+    ("spl_token_group_interface", "update_authority"),
+    ("spl_token_group_interface", "initialize_member"),
+    ("spl-transfer-hook-interface", "execute"),
+    ("spl-transfer-hook-interface", "initialize-extra-account-metas"),
+    ("spl-transfer-hook-interface", "update-extra-account-metas"),
+];
 /// Most data bytes indexed for 8-byte lookups.
 const MAX_INDEXED_DATA: usize = 32 << 20;
 /// Most distinct identifier runs considered for account and event names.
@@ -405,6 +422,32 @@ pub fn analyze(constants: &[Constant], chains: &ByteCompares, sections: &[DataSe
             if !entry.log_string_offsets.contains(&log.file_offset) {
                 entry.log_string_offsets.push(log.file_offset);
             }
+        }
+    }
+
+    // SPL interface instructions no log names, from their published hash inputs.
+    for (namespace, input) in INTERFACE_INSTRUCTIONS {
+        let key = discriminator(namespace, input);
+        let name = input.replace('-', "_");
+        if instructions.contains_key(&name) || instructions.values().any(|i| i.discriminator.as_deref() == Some(hex(&key).as_str())) {
+            continue;
+        }
+        if let Some(evidence) = haystack.find_instruction(key) {
+            instructions.insert(
+                name.clone(),
+                RecoveredInstruction {
+                    name,
+                    log_name: String::new(),
+                    namespace: namespace.to_string(),
+                    discriminator: Some(hex(&key)),
+                    status: InstructionStatus::Implemented,
+                    log_string_offsets: Vec::new(),
+                    discriminator_evidence: evidence,
+                    accounts_check_offset: None,
+                    accounts: None,
+                    arguments: None,
+                },
+            );
         }
     }
 

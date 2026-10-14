@@ -24,6 +24,10 @@ pub struct Report {
     /// The `match instruction_data[0]` dispatch of a native (non-Anchor) program, when one is found.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_dispatch: Option<NativeDispatch>,
+    /// Instructions known only by their 8-byte discriminator: the program compares the first 8
+    /// bytes of its instruction data with these values, but no name for them was recovered.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unnamed_instructions: Vec<UnnamedInstruction>,
     pub unknowns: Vec<String>,
     /// Non-fatal problems met while parsing; analysis continued past them.
     pub diagnostics: Vec<String>,
@@ -112,6 +116,24 @@ pub struct PanicLocationFact {
 pub struct SecurityTxtField {
     pub field: String,
     pub value: String,
+}
+
+/// An instruction found by its discriminator alone. The program's own entrypoint was run to see
+/// where it puts the instruction data, and a walk from there with these 8 bytes at the start of
+/// the data reached a comparison that found them equal to what it tests: Anchor instructions whose
+/// names are not in the binary, or a native program's own 8-byte instruction tags.
+#[derive(Debug, Serialize)]
+pub struct UnnamedInstruction {
+    /// The 8 bytes, hex, in instruction data order.
+    pub discriminator: String,
+    /// The bytes as text, when all 8 are printable ASCII (a tag such as `SPMBUY01`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// File offset of the comparison that matched them.
+    pub match_offset: u64,
+    /// The byte layout of the arguments after the discriminator, as for named instructions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<ArgumentLayout>,
 }
 
 /// A native program's instruction dispatch: which tag values reach which code.
@@ -204,7 +226,8 @@ pub enum EvidenceKind {
 pub struct RecoveredInstruction {
     /// Inferred Rust handler name, as Anchor hashes it.
     pub name: String,
-    /// The name as it appears in the program's log string.
+    /// The name as it appears in the program's log string. Empty for an SPL interface instruction
+    /// named from the interface's published hash input, which the program does not log.
     pub log_name: String,
     /// The hash namespace the discriminator matched: `global` for Anchor handlers, or an SPL
     /// interface namespace such as `spl-transfer-hook-interface`.

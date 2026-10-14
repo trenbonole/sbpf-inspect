@@ -272,13 +272,87 @@ fn argument_layout_follows_the_matching_dispatch() {
     let cfg = Cfg::build(&p);
     let chains = ByteCompares::scan(p.text, p.text_file_offset);
     let names = BTreeMap::from([("deposit".to_string(), (disc, Vec::new())), ("other".to_string(), (disc ^ 1, Vec::new()))]);
-    let (layouts, exhausted) = crate::args::recover(&p, &cfg, &chains, &names);
+    let (layouts, exhausted) = crate::args::recover(&p, &cfg, &chains, &names, &[]);
     assert!(!exhausted);
     let deposit = layouts.get("deposit").expect("its dispatch is walked");
     assert_eq!(deposit.fields.iter().map(|f| (f.offset, f.size, f.copied)).collect::<Vec<_>>(), [(0, 8, false)]);
     assert_eq!(deposit.fixed_size, 8);
     assert!(deposit.complete && !deposit.irregular && !deposit.truncated);
     assert!(!layouts.contains_key("other"), "a discriminator the code never tests has no dispatch to walk");
+}
+
+const TAG1: u64 = u64::from_le_bytes(*b"TAGONE01");
+const TAG2: u64 = u64::from_le_bytes(*b"TAGTWO02");
+const OTHER: u64 = 0x5a3c_91e7_d24b_6f18;
+
+/// A native program with its own 8-byte instruction tags. The entrypoint decodes an input with no
+/// accounts (the account count, the data length, the data) and calls `process(input, data, len)`,
+/// which tests the tags: TAG1 takes a u64, TAG2 a u8. Two tests must not count as tags: the first
+/// data byte alone against OTHER's low byte, and OTHER whole against the input's account count.
+fn tagged_program() -> Vec<u8> {
+    Builder { version: 0, ..Default::default() }
+        .text(&[
+            &ins(0x79, 2, 1, 0, 0),                    // 0: ldxdw r2, [r1+0]   account count
+            &ins(0x55, 2, 0, 5, 0),                    // 1: jne r2, 0, +5 -> 7
+            &ins(0x79, 3, 1, 8, 0),                    // 2: ldxdw r3, [r1+8]   data length
+            &ins(0xbf, 2, 1, 0, 0),                    // 3: mov r2, r1
+            &ins(0x07, 2, 0, 0, 16),                   // 4: add r2, 16         data
+            &ins(0x85, 0, 0, 0, 3),                    // 5: call process (9)
+            &ins(0x95, 0, 0, 0, 0),                    // 6: exit
+            &ins(0xb7, 0, 0, 0, 1),                    // 7: mov r0, 1
+            &ins(0x95, 0, 0, 0, 0),                    // 8: exit
+            &ins(0xa5, 3, 0, 24, 8),                   // 9: process: jlt r3, 8, +24 -> 34
+            &ins(0x79, 4, 2, 0, 0),                    // 10: ldxdw r4, [r2+0]
+            &lddw(5, TAG1),                            // 11: lddw r5, TAG1
+            &ins(0x5d, 4, 5, 4, 0),                    // 13: jne r4, r5, +4 -> 18
+            &ins(0x79, 6, 2, 8, 0),                    // 14: ldxdw r6, [r2+8]  a u64
+            &ins(0x07, 6, 0, 0, 1),                    // 15: add r6, 1
+            &ins(0xb7, 0, 0, 0, 0),                    // 16: mov r0, 0
+            &ins(0x95, 0, 0, 0, 0),                    // 17: exit
+            &lddw(5, TAG2),                            // 18: lddw r5, TAG2
+            &ins(0x5d, 4, 5, 4, 0),                    // 20: jne r4, r5, +4 -> 25
+            &ins(0x71, 6, 2, 8, 0),                    // 21: ldxb r6, [r2+8]   a u8
+            &ins(0x07, 6, 0, 0, 1),                    // 22: add r6, 1
+            &ins(0xb7, 0, 0, 0, 0),                    // 23: mov r0, 0
+            &ins(0x95, 0, 0, 0, 0),                    // 24: exit
+            &ins(0xbf, 6, 4, 0, 0),                    // 25: mov r6, r4
+            &ins(0x57, 6, 0, 0, 0xff),                 // 26: and r6, 255       the first data byte
+            &ins(0x55, 6, 0, 1, (OTHER & 0xff) as i32), // 27: jne r6, OTHER's low byte, +1 -> 29
+            &ins(0xb7, 0, 0, 0, 2),                    // 28: mov r0, 2
+            &ins(0x79, 7, 1, 0, 0),                    // 29: ldxdw r7, [r1+0]  the input, not the data
+            &lddw(8, OTHER),                           // 30: lddw r8, OTHER
+            &ins(0x5d, 7, 8, 1, 0),                    // 32: jne r7, r8, +1 -> 34
+            &ins(0xb7, 0, 0, 0, 3),                    // 33: mov r0, 3
+            &ins(0x95, 0, 0, 0, 0),                    // 34: exit
+        ])
+        .build()
+}
+
+#[test]
+fn entrypoint_run_finds_the_instruction_data() {
+    let elf = tagged_program();
+    let p = Program::load(&elf).unwrap();
+    let cfg = Cfg::build(&p);
+    let hs = crate::emu::handovers(&p, &cfg);
+    // After `add r2, 16`, at the call that hands the data on (instruction 5): r2 holds its address.
+    // That is also the first place the data is held, so there is one handover.
+    assert_eq!(hs.len(), 1);
+    let h = &hs[0];
+    assert_eq!((h.func, h.at, h.regs.as_slice(), h.slots.as_slice()), (0, 5, &[(2u8, 0i64)][..], &[][..]));
+}
+
+#[test]
+fn unnamed_tags_are_confirmed_on_the_instruction_data() {
+    let r = inspect(&tagged_program()).expect("inspects");
+    let found: Vec<(Option<&str>, Vec<(u32, u32)>)> = r
+        .unnamed_instructions
+        .iter()
+        .map(|u| (u.text.as_deref(), u.arguments.as_ref().map_or(Vec::new(), |a| a.fields.iter().map(|f| (f.offset, f.size)).collect())))
+        .collect();
+    // OTHER is tested against the input and its low byte against the first data byte, so it is not
+    // a tag: one byte matching, or 8 bytes matching something else, does not count.
+    assert_eq!(found, [(Some("TAGONE01"), vec![(0, 8)]), (Some("TAGTWO02"), vec![(0, 1)])]);
+    assert_eq!(r.unnamed_instructions[0].discriminator, "5441474f4e453031");
 }
 
 /// xorshift64*: deterministic, so a failure reproduces.
@@ -297,12 +371,14 @@ fn mutated_programs_never_panic() {
     let base = sample_v0().build();
     let v3 = Builder { version: 3, ..Default::default() }.text(&[&ins(0x85, 0, 1, 0, 1), &ins(0x95, 0, 0, 0, 0), &ins(0x95, 0, 0, 0, 0)]).build();
     let anchorish = dispatcher(0x1122_3344_5566_7788);
+    let tagged = tagged_program();
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-    for round in 0..3000 {
-        let mut b = match round % 3 {
+    for round in 0..4000 {
+        let mut b = match round % 4 {
             0 => base.clone(),
             1 => v3.clone(),
-            _ => anchorish.clone(),
+            2 => anchorish.clone(),
+            _ => tagged.clone(),
         };
         let edits = 1 + (rng.next() % 24) as usize;
         for _ in 0..edits {

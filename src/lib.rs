@@ -14,6 +14,7 @@ pub mod cfg;
 pub mod constants;
 pub mod dispatch;
 pub mod elf;
+pub mod emu;
 pub mod isa;
 pub mod literals;
 pub mod program;
@@ -22,8 +23,10 @@ pub mod strings;
 pub mod syscalls;
 #[cfg(test)]
 mod tests;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "bindgen"))]
 mod wasm;
+#[cfg(all(target_arch = "wasm32", not(feature = "bindgen")))]
+mod raw;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -36,7 +39,7 @@ use crate::cfg::Cfg;
 use crate::program::{CallTarget, LoadError, Program};
 use crate::report::{
     Artifact, ConstantCoverage, ElfFacts, Engine, EvidenceKind, InstructionStatus, NativeDispatch, NativeHandler,
-    PanicLocationFact, Report, SectionFact, SecurityTxtField, SyscallUse,
+    PanicLocationFact, Report, SectionFact, SecurityTxtField, SyscallUse, UnnamedInstruction,
 };
 
 pub const ENGINE_NAME: &str = "sbpf-inspect";
@@ -81,14 +84,15 @@ fn is_data_section(name: &str) -> bool {
 }
 
 const UNKNOWNS: &[&str] = &[
-    "Instruction names come from Anchor's `Instruction: <Name>` log strings. Programs built without those logs and other frameworks yield none; for native programs only the tags of their dispatch are found, named when their handlers log names.",
+    "Instruction names come from Anchor's `Instruction: <Name>` log strings. An instruction whose name is not in the binary is listed under unnamed_instructions when the code proves its 8-byte discriminator, and its name stays unknown. Native programs' one-byte tags are listed under native_dispatch, named when their handlers log names.",
+    "Unnamed instructions are found only when the program's entrypoint can be run to the instruction data on an input without accounts, and the dispatch tests all 8 bytes for equality within four call levels of it. Dispatch that compares in a loop, or reads the tag only after checking accounts, is missed.",
     "A discriminator counts as found only when its 8 bytes are a 64-bit immediate (`lddw`, or `mov32` + `hor64` on sBPF v2 and later) or appear in a data section, or, for instructions, when bytes 2 to 7 are compared one at a time in order (byte-wise dispatch). Other code shapes, such as two 32-bit comparisons, are not detected.",
     "Event names are recovered only when the name appears in the program's strings. Calls a program makes to itself starting with Anchor's event tag (see the event_cpi_tag marker) carry events, not instructions.",
     "Account names are recovered only when the name itself appears in the program's strings. A recovered account type can belong to another program this one validates, such as pump AMM's Pool inside pump.fun's bonding-curve program.",
     "Account lists are recovered only for Anchor instructions whose accounts check (try_accounts) can be located, and list only accounts whose names the binary embeds. An account positioned `matched` or `appended` was named only by later checks, so its position is weaker evidence. Of the constraints, only mut and signer are reported.",
     "Argument layouts are byte offsets and sizes read on the instruction's code path: names and types are not in the binary, a 1-byte field may be a u8 or a bool, and a variable-length value (vector, string, option) ends the layout.",
     "Error codes defined by the program are not recovered.",
-    "Deployment identity, upgrade authority, verified-build status and runtime behaviour are unknown: the analysis is offline and does not execute the program.",
+    "Deployment identity, upgrade authority, verified-build status and runtime behaviour are unknown: the analysis is offline, and the only code it runs is the entrypoint's decoding of a made-up input with no accounts, to find where the instruction data goes.",
 ];
 
 /// Inspect one sBPF program ELF.
@@ -156,6 +160,37 @@ pub fn inspect(bytes: &[u8]) -> Result<Report, InspectError> {
             log_sites.entry(name).or_default().push(i);
         }
     }
+    // Instructions known by their discriminator: values the program's own code tests the start of
+    // its instruction data against, as its entrypoint delivers the data. Those whose names are not
+    // in the binary are reported as unnamed (Anchor instructions that are not logged, native
+    // programs' own 8-byte tags); a `referenced` instruction found this way is implemented after all.
+    let handovers = emu::handovers(&p, &cfg);
+    let mut found = Vec::new();
+    if !handovers.is_empty() {
+        let mut known: BTreeSet<u64> = anchor
+            .instructions
+            .iter()
+            .filter(|ix| ix.status != InstructionStatus::Referenced)
+            .filter_map(|ix| Some(u64::from_str_radix(ix.discriminator.as_deref()?, 16).ok()?.swap_bytes()))
+            .collect();
+        known.extend([anchor::IDL_IX_TAG, anchor::EVENT_IX_TAG]);
+        let exhausted;
+        (found, exhausted) = args::unnamed(&p, &cfg, &handovers, &known);
+        if exhausted {
+            diagnostics.push("the search for unnamed instructions hit its step budget; some may be missing".into());
+        }
+        found.retain(|&(v, _)| {
+            let hex = anchor::hex(&v.to_le_bytes());
+            match anchor.instructions.iter_mut().find(|ix| ix.status == InstructionStatus::Referenced && ix.discriminator.as_deref() == Some(hex.as_str())) {
+                Some(ix) => {
+                    ix.status = InstructionStatus::Implemented;
+                    false
+                }
+                None => true,
+            }
+        });
+    }
+
     let discriminators: BTreeMap<String, (u64, Vec<u32>)> = anchor
         .instructions
         .iter()
@@ -165,7 +200,7 @@ pub fn inspect(bytes: &[u8]) -> Result<Report, InspectError> {
             Some((ix.name.clone(), (value, log_sites.get(ix.log_name.as_str()).cloned().unwrap_or_default())))
         })
         .collect();
-    let (layouts, exhausted) = args::recover(&p, &cfg, &chains, &discriminators);
+    let (layouts, exhausted) = args::recover(&p, &cfg, &chains, &discriminators, &[]);
     if exhausted {
         anchor.limits_hit.push("argument-layout search hit its program-wide step budget; some layouts are missing".into());
     }
@@ -175,6 +210,22 @@ pub fn inspect(bytes: &[u8]) -> Result<Report, InspectError> {
     }
     for ix in &mut anchor.instructions {
         ix.arguments = layouts.get(&ix.name).cloned();
+    }
+    let mut unnamed_instructions = Vec::new();
+    if !found.is_empty() {
+        let named: BTreeMap<String, (u64, Vec<u32>)> =
+            found.iter().map(|&(v, _)| (anchor::hex(&v.to_le_bytes()), (v, Vec::new()))).collect();
+        let (layouts, _) = args::recover(&p, &cfg, &chains, &named, &handovers);
+        for (v, at) in found {
+            let bytes = v.to_le_bytes();
+            let discriminator = anchor::hex(&bytes);
+            unnamed_instructions.push(UnnamedInstruction {
+                text: bytes.iter().all(|b| b.is_ascii_graphic()).then(|| bytes.iter().map(|&b| b as char).collect()),
+                match_offset: p.file_offset(at),
+                arguments: layouts.get(&discriminator).cloned(),
+                discriminator,
+            });
+        }
     }
 
     // Native programs switch on an instruction-data tag instead of Anchor discriminators.
@@ -249,6 +300,7 @@ pub fn inspect(bytes: &[u8]) -> Result<Report, InspectError> {
         security_txt,
         anchor,
         native_dispatch,
+        unnamed_instructions,
         unknowns: UNKNOWNS.iter().map(|s| s.to_string()).collect(),
         diagnostics,
     })

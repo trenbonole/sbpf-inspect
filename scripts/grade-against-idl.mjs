@@ -118,33 +118,51 @@ function points(exp, fixed) {
   }
   return pts;
 }
-const A = { exact: 0, consistent: 0, read: 0, gradable: 0, none: 0, missing: 0, noArgs: 0, noArgsRight: 0, ungradable: 0 };
-for (const i of right) {
-  const want = truth.get(i.discriminator);
-  const e = expected(want.args || []);
-  const a = i.arguments;
-  if (e.fixed === 0 && !e.complete) { A.ungradable++; continue; }
-  if (e.fixed === 0) { A.noArgs++; if (a && a.fields.length === 0) A.noArgsRight++; continue; }
-  A.gradable++;
-  if (!a) { A.missing++; continue; }
-  if (a.fields.length === 0) { A.none++; continue; }
-  A.read++;
-  const pts = points(e.fields, e.fixed);
-  const inPrefix = a.fields.filter((f) => f.offset < e.fixed);
-  const consistent = inPrefix.every((f) => pts.has(f.offset) && (f.offset + f.size > e.fixed || pts.has(f.offset + f.size)));
-  const boundaries = new Set(inPrefix.map((f) => f.offset));
-  const exact = consistent && e.fields.every((f) => boundaries.has(f.offset)) && (e.complete ? a.fixed_size === e.fixed : a.fixed_size >= e.fixed);
-  if (consistent) A.consistent++;
-  if (exact) A.exact++;
-  if (verbose && !exact) {
-    const show = (fs) => fs.map((f) => `${f.offset}+${f.size}${f.copied ? "c" : ""}`).join(" ");
-    console.log(`  ${want.name} arguments
+/** Grade the layouts of `found` instructions (each with its discriminator and `arguments`). */
+function gradeArgs(found) {
+  const A = { exact: 0, consistent: 0, read: 0, gradable: 0, none: 0, missing: 0, noArgs: 0, noArgsRight: 0, ungradable: 0 };
+  for (const i of found) {
+    const want = truth.get(i.discriminator);
+    const e = expected(want.args || []);
+    const a = i.arguments;
+    if (e.fixed === 0 && !e.complete) { A.ungradable++; continue; }
+    if (e.fixed === 0) { A.noArgs++; if (a && a.fields.length === 0) A.noArgsRight++; continue; }
+    A.gradable++;
+    if (!a) { A.missing++; continue; }
+    if (a.fields.length === 0) { A.none++; continue; }
+    A.read++;
+    const pts = points(e.fields, e.fixed);
+    const inPrefix = a.fields.filter((f) => f.offset < e.fixed);
+    const consistent = inPrefix.every((f) => pts.has(f.offset) && (f.offset + f.size > e.fixed || pts.has(f.offset + f.size)));
+    const boundaries = new Set(inPrefix.map((f) => f.offset));
+    const exact = consistent && e.fields.every((f) => boundaries.has(f.offset)) && (e.complete ? a.fixed_size === e.fixed : a.fixed_size >= e.fixed);
+    if (consistent) A.consistent++;
+    if (exact) A.exact++;
+    if (verbose && !exact) {
+      const show = (fs) => fs.map((f) => `${f.offset}+${f.size}${f.copied ? "c" : ""}`).join(" ");
+      console.log(`  ${want.name} arguments
     idl  : ${show(e.fields)}${e.complete ? "" : " ..."}
     found: ${show(a.fields)}`);
+    }
   }
+  return A;
 }
+const A = gradeArgs(right);
 console.log(`argument layouts: ${A.gradable} instructions with a fixed-size prefix: ${A.exact} exact, ${A.read - A.exact} not, ${A.none} with no reads found, ${A.missing} without a layout`);
 console.log(`  precision: ${A.consistent} of ${A.read} layouts put every field edge on a real field boundary`);
 console.log(`  no arguments: ${A.noArgsRight} of ${A.noArgs} have an empty layout; ${A.ungradable} start with a variable-size argument and are not graded`);
+
+// Instructions found by their discriminator alone. The IDL names those it lists; the others are
+// either missing from the IDL or wrong.
+const unnamed = r.unnamed_instructions || [];
+const unnamedInIdl = unnamed.filter((u) => truth.has(u.discriminator));
+const unnamedNotInIdl = unnamed.filter((u) => !truth.has(u.discriminator));
+console.log(`unnamed instructions: ${unnamed.length} found, ${unnamedInIdl.length} are IDL instructions, ${unnamedNotInIdl.length} not in IDL`);
+if (unnamedInIdl.length) console.log("  IDL names:", unnamedInIdl.map((u) => truth.get(u.discriminator).name).join(", "));
+if (unnamedNotInIdl.length) console.log("  not in IDL:", unnamedNotInIdl.map((u) => u.text ?? u.discriminator).join(", "));
+if (unnamedInIdl.length) {
+  const U = gradeArgs(unnamedInIdl);
+  console.log(`  their argument layouts: ${U.gradable} with a fixed-size prefix: ${U.exact} exact, ${U.read - U.exact} not, ${U.none} with no reads found, ${U.missing} without a layout; precision ${U.consistent} of ${U.read}; no arguments: ${U.noArgsRight} of ${U.noArgs} empty`);
+}
 console.log(`referenced (called, not implemented): ${r.anchor.instructions.filter((i) => i.status === "referenced").map((i) => i.name).join(", ") || "none"}`);
 console.log(`sbpf ${r.elf.sbpf_version}, ${r.syscalls.length} named calls, ${r.constants.lddw + r.constants.mov32_hor64} 64-bit immediates, diagnostics ${r.diagnostics.length}`);

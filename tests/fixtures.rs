@@ -129,6 +129,16 @@ fn anchor_argument_layouts_follow_the_source() {
 }
 
 #[test]
+fn every_dispatched_instruction_is_named_so_none_is_unnamed() {
+    // The search for unnamed instructions finds what the dispatch tests; here the logs already
+    // name all of it, and nothing else (account types, events, the IDL and event tags) counts.
+    let r = load("inspect_fixture_anchor.so");
+    assert!(r.unnamed_instructions.is_empty(), "{:?}", r.unnamed_instructions.iter().map(|u| &u.discriminator).collect::<Vec<_>>());
+    let r = load("inspect_fixture_native.so");
+    assert!(r.unnamed_instructions.is_empty());
+}
+
+#[test]
 fn panic_locations_name_source_files() {
     let r = load("inspect_fixture_anchor.so");
     assert!(!r.panic_locations.is_empty());

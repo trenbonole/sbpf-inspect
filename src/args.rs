@@ -58,6 +58,16 @@ const MAX_STARTS: usize = 8;
 const TRACE_WINDOW: usize = 600;
 /// Largest `memcpy` whose bytes are modelled one by one.
 const MAX_COPY: u64 = 64;
+/// Constants tried as unnamed discriminators.
+const MAX_ID_CANDIDATES: usize = 1024;
+/// Instructions interpreted for all of them together.
+const UNNAMED_BUDGET: usize = 400_000_000;
+/// Walks spent discovering discriminators byte by byte from one start, the instructions one of
+/// them may interpret, and the instructions all of them may (the rest of [`UNNAMED_BUDGET`] is
+/// for confirming what they found).
+const MAX_DISCOVERY_WALKS: usize = 1024;
+const DISCOVERY_WALK_BUDGET: usize = 500_000;
+const DISCOVERY_BUDGET: usize = 30_000_000;
 
 /// An abstract value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -82,6 +92,10 @@ enum Px {
     Zero,
     /// Instruction data byte k.
     Data(i64),
+    /// Discriminator byte k (the second number), holding the first number: how the walks that find
+    /// unnamed discriminators see them, so a value split off by shifts and masks names exactly the
+    /// bytes it holds.
+    Disc(u8, u8),
 }
 
 /// The value a load of data bytes `[k, k + w)` gives (zero-extended).
@@ -98,9 +112,38 @@ fn pixels(v: V) -> [Px; 8] {
     }
 }
 
-/// A [`V::Mix`] that holds no data byte is just unknown.
+/// A [`V::Mix`] needs a data byte, or known discriminator bytes and zeros only (a number whose
+/// bytes keep where they came from); anything else is unknown.
 fn mix(b: [Px; 8]) -> V {
-    if b.iter().any(|p| matches!(p, Px::Data(_))) { V::Mix(b) } else { V::Unknown }
+    if b.iter().any(|p| matches!(p, Px::Data(_))) || known_bytes(&b).is_some() { V::Mix(b) } else { V::Unknown }
+}
+
+/// The number a [`V::Mix`] of known discriminator bytes and zeros holds, and those bytes as a
+/// mask, counting only its first `lane` bytes.
+fn known_bytes_in(b: &[Px], lane: usize) -> Option<(u64, u8)> {
+    let (mut v, mut m) = (0u64, 0u8);
+    for (i, p) in b.iter().enumerate() {
+        match *p {
+            Px::Disc(x, k) => {
+                v |= u64::from(x) << (8 * i);
+                if i < lane {
+                    m |= 1 << k;
+                }
+            }
+            Px::Zero => {}
+            _ => return None,
+        }
+    }
+    (m != 0 || b.iter().any(|p| matches!(p, Px::Disc(..)))).then_some((v, m))
+}
+
+fn known_bytes(b: &[Px]) -> Option<(u64, u8)> {
+    known_bytes_in(b, 8)
+}
+
+/// Whether a value holds instruction data bytes.
+fn has_data(v: V) -> bool {
+    matches!(v, V::Mix(b) if b.iter().any(|p| matches!(p, Px::Data(_))))
 }
 
 /// Runs of consecutive data bytes in `b`, as (position in `b`, first data byte, length).
@@ -175,7 +218,17 @@ fn known(v: V) -> Option<(u64, u8)> {
     match v {
         V::Const(c) => Some((c, 0)),
         V::Disc(c, m) => Some((c, m)),
+        V::Mix(b) => known_bytes(&b),
         _ => None,
+    }
+}
+
+/// The discriminator bytes a comparison of `lane` bytes reads from `v`.
+fn compared_bytes(v: V, lane: usize) -> u8 {
+    match v {
+        V::Mix(b) => known_bytes_in(&b, lane).map_or(0, |(_, m)| m),
+        V::Disc(_, m) => m,
+        _ => 0,
     }
 }
 
@@ -191,7 +244,7 @@ fn add(v: V, d: i64) -> V {
 
 
 /// Exact arithmetic on known values, with the loader's 32-bit semantics for `version`.
-fn compute(version: u32, wide: bool, op: AluOp, a: u64, b: u64) -> Option<u64> {
+pub(crate) fn compute(version: u32, wide: bool, op: AluOp, a: u64, b: u64) -> Option<u64> {
     if wide {
         return Some(match op {
             AluOp::Mov => b,
@@ -230,7 +283,7 @@ fn compute(version: u32, wide: bool, op: AluOp, a: u64, b: u64) -> Option<u64> {
     })
 }
 
-fn holds(cond: Cond, wide: bool, a: u64, b: u64) -> bool {
+pub(crate) fn holds(cond: Cond, wide: bool, a: u64, b: u64) -> bool {
     let (a, b) = if wide { (a, b) } else { (a & 0xffff_ffff, b & 0xffff_ffff) };
     let (sa, sb) = if wide { (a as i64, b as i64) } else { (a as u32 as i32 as i64, b as u32 as i32 as i64) };
     match cond {
@@ -293,6 +346,7 @@ impl Slot {
 fn px_byte(p: Px) -> Option<B> {
     match p {
         Px::Data(k) => Some(B::Data(k)),
+        Px::Disc(v, k) => Some(B::Known(v, 1 << k)),
         Px::Zero => Some(B::Known(0, 0)),
         Px::Unknown => None,
     }
@@ -348,6 +402,8 @@ fn byte_mask(m: u8, i: usize) -> u8 {
 struct State {
     regs: [V; 11],
     mem: BTreeMap<(u32, i64), Slot>,
+    /// Discriminator bytes an equality test on this path found equal (walks with exact bytes only).
+    matched: u8,
 }
 
 impl State {
@@ -367,12 +423,16 @@ impl State {
             (V::Data(x), V::Data(y)) if lenient && (x - y).abs() <= 4096 => Some(V::Data(x.max(y))),
             // Data bytes on one path, a number or nothing known on the other (an error path that
             // builds a different result in the same register): the data bytes go on.
-            (m @ V::Mix(_), V::Unknown | V::Const(_) | V::Disc(..)) | (V::Unknown | V::Const(_) | V::Disc(..), m @ V::Mix(_)) if lenient => Some(m),
+            (m, V::Unknown | V::Const(_) | V::Disc(..)) | (V::Unknown | V::Const(_) | V::Disc(..), m) if lenient && has_data(m) => Some(m),
             _ => None,
         };
         let mut changed = false;
+        if self.matched & o.matched != self.matched {
+            self.matched &= o.matched;
+            changed = true;
+        }
         for r in 0..11 {
-            if self.regs[r] != o.regs[r] && (self.regs[r] != V::Unknown || (lenient && matches!(o.regs[r], V::Mix(_)))) {
+            if self.regs[r] != o.regs[r] && (self.regs[r] != V::Unknown || (lenient && has_data(o.regs[r]))) {
                 let v = further(self.regs[r], o.regs[r]).unwrap_or(V::Unknown);
                 if v != self.regs[r] {
                     self.regs[r] = v;
@@ -464,12 +524,31 @@ struct Walk<'a> {
     p: &'a Program<'a>,
     cfg: &'a Cfg,
     disc: [u8; 8],
+    /// The discriminator bytes known (bit k: byte k); the others read as unknown data bytes.
+    known_bytes: u8,
+    /// When discovering discriminators: equality tests of unknown discriminator bytes against a
+    /// constant, as (first byte, length, the bytes as a little-endian value).
+    tests: Option<BTreeSet<(i64, u32, u64)>>,
     /// Data byte ranges whose values the code uses: the argument fields.
     reads: BTreeSet<(i64, u32)>,
     /// Data loaded and stored to the stack as it is: (first data byte, length, frame, offset).
     copies: Vec<(i64, u32, u32, i64)>,
     /// Discriminator bytes that took part in a decided branch.
     checked: u8,
+    /// Discriminator bytes a decided comparison found equal to what the code tests them against,
+    /// and the branch where the last of the 8 matched.
+    matched: u8,
+    matched_at: Option<u32>,
+    /// Stop as soon as all 8 bytes matched: only whether they do is wanted.
+    stop_on_match: bool,
+    /// A call the walk does not follow may have written anything at or above a stack address it
+    /// was handed (an out-parameter it filled). The layout walks keep such slots, which suits
+    /// recovering fields; the walks that confirm discriminators drop them, so a stale data pointer
+    /// left in a reused slot never stands in for what the call put there.
+    sound_calls: bool,
+    /// Discriminator bytes are loaded as known bytes that keep their positions (`Px::Disc`), and
+    /// matching is tracked per path: a candidate counts only when one path finds all 8 equal.
+    exact_bytes: bool,
     /// Branches the walk could not decide, so took both ways.
     undecided: u64,
     steps: usize,
@@ -487,6 +566,55 @@ struct Walk<'a> {
 impl Walk<'_> {
     fn exhausted(&self) -> bool {
         self.steps >= self.budget
+    }
+
+    fn all_known(&self, k: i64, n: u32) -> bool {
+        let m = ((1u16 << n) - 1) << k;
+        u16::from(self.known_bytes) & m == m
+    }
+
+    /// When discovering: an equality test of `v` against the number `c` under a comparison of
+    /// `lane` bytes, where `v` is one run of unknown discriminator bytes, the rest zeros or known
+    /// discriminator bytes. Records what the run must hold for the two to be equal. A
+    /// discriminator tree tests a byte only where the bytes before it matched, so below the first
+    /// level a test counts only on a path (`path`: the bytes equality tests matched on it) where
+    /// every known byte matched; elsewhere the code is past the dispatch (a handler reached through
+    /// range checks on a one-byte tag, reading its arguments).
+    fn record_test(&mut self, v: V, c: u64, lane: usize, path: u8) -> Test {
+        let (Some(tests), V::Mix(b)) = (self.tests.as_mut(), v) else { return Test::None };
+        let runs = data_runs(&b[..lane]);
+        let [(pos, k, n)] = runs.as_slice() else { return Test::None };
+        let (pos, k, n) = (*pos, *k, *n);
+        if k < 0 || k + i64::from(n) > 8 {
+            return Test::None;
+        }
+        let mut agree = true;
+        // Known bytes this test compares too: when they agree with the constant, the test itself
+        // checks them.
+        let mut covers = 0u8;
+        for (i, p) in b[..lane].iter().enumerate() {
+            if (pos..pos + n as usize).contains(&i) {
+                continue;
+            }
+            let byte = (c >> (8 * i)) as u8;
+            match *p {
+                Px::Zero => agree &= byte == 0,
+                Px::Disc(x, k) => {
+                    agree &= byte == x;
+                    covers |= 1 << k;
+                }
+                _ => return Test::None,
+            }
+        }
+        if !agree {
+            return Test::Unequal;
+        }
+        if (path | covers) & self.known_bytes != self.known_bytes {
+            return Test::OffPath;
+        }
+        let run = if n == 8 { u64::MAX } else { (1u64 << (8 * n)) - 1 };
+        tests.insert((k, n, (c >> (8 * pos)) & run));
+        Test::Recorded
     }
 
     fn operand(s: &State, o: Operand) -> V {
@@ -528,6 +656,16 @@ impl Walk<'_> {
         self.consume(base);
         match add(base, i64::from(off)) {
             V::Data(k) if k >= 8 => loaded(k, width),
+            V::Data(k) if k >= 0 && k as u32 + width <= 8 && (self.exact_bytes || !self.all_known(k, width)) => V::Mix(std::array::from_fn(|i| {
+                let j = k + i as i64;
+                if i as u32 >= width {
+                    Px::Zero
+                } else if self.all_known(j, 1) {
+                    Px::Disc(self.disc[j as usize], j as u8)
+                } else {
+                    Px::Data(j)
+                }
+            })),
             V::Data(k) if k >= 0 && k as u32 + width <= 8 => {
                 let mut b = [0u8; 8];
                 b[..width as usize].copy_from_slice(&self.disc[k as usize..k as usize + width as usize]);
@@ -569,7 +707,8 @@ impl Walk<'_> {
     /// One byte at `addr`, for a copy or a comparison.
     fn byte_at(&self, s: &State, addr: V) -> Option<B> {
         match addr {
-            V::Data(k) if (0..8).contains(&k) => Some(B::Known(self.disc[k as usize], 1 << k)),
+            V::Data(k) if (0..8).contains(&k) && self.all_known(k, 1) => Some(B::Known(self.disc[k as usize], 1 << k)),
+            V::Data(k) if (0..8).contains(&k) => Some(B::Data(k)),
             V::Data(k) if k >= 8 => Some(B::Data(k)),
             V::Frame(f, o) => s.byte(f, o),
             V::Const(a) => self.p.read(a, 1).map(|b| B::Known(b[0], 0)),
@@ -653,7 +792,7 @@ impl Walk<'_> {
 
     /// `sol_memcmp_(a, b, n, &result)`: when both sides are known bytes, the result is known too.
     /// Data bytes compared are used.
-    fn memcmp(&mut self, s: &mut State) {
+    fn memcmp(&mut self, s: &mut State, at: u32) {
         let (a, b, n, out) = (s.regs[1], s.regs[2], s.regs[3], s.regs[4]);
         let mut result = V::Unknown;
         if let V::Const(n) = n {
@@ -662,6 +801,24 @@ impl Walk<'_> {
                 let ys: Vec<Option<B>> = (0..n as i64).map(|i| self.byte_at(s, add(b, i))).collect();
                 self.consume_bytes(&xs);
                 self.consume_bytes(&ys);
+                let on_path = s.matched & self.known_bytes == self.known_bytes;
+                if let (Some(tests), true) = (self.tests.as_mut(), on_path) {
+                    for (d, c) in [(&xs, &ys), (&ys, &xs)] {
+                        let k0 = match d.first() {
+                            Some(Some(B::Data(k))) => *k,
+                            _ => continue,
+                        };
+                        let run = d.iter().enumerate().all(|(i, x)| *x == Some(B::Data(k0 + i as i64)));
+                        let bytes: Option<Vec<u8>> = c.iter().map(|y| match y { Some(B::Known(b, _)) => Some(*b), _ => None }).collect();
+                        if let (true, Some(bytes)) = (run && k0 >= 0 && k0 + n as i64 <= 8, bytes) {
+                            let mut v = [0u8; 8];
+                            v[..bytes.len()].copy_from_slice(&bytes);
+                            tests.insert((k0, n as u32, u64::from_le_bytes(v)));
+                            // As for a comparison: only the bytes-differ outcome is followed.
+                            result = V::Const(1);
+                        }
+                    }
+                }
                 let (mut differ, mut mask, mut all) = (false, 0u8, true);
                 for (x, y) in xs.iter().zip(&ys) {
                     match (x, y) {
@@ -672,8 +829,19 @@ impl Walk<'_> {
                         _ => all = false,
                     }
                 }
-                if all && mask != 0 {
+                if all && mask != 0 && self.tests.is_none() {
                     result = V::Disc(u64::from(differ), mask);
+                    if !differ {
+                        if self.exact_bytes {
+                            s.matched |= mask;
+                            if s.matched == 0xff && self.matched_at.is_none() {
+                                self.matched = 0xff;
+                                self.matched_at = Some(at);
+                            }
+                        } else {
+                            self.matched |= mask;
+                        }
+                    }
                 }
             }
         }
@@ -716,6 +884,11 @@ impl Walk<'_> {
                         // Byte moves on data values (assembling an unaligned value, say) keep where each byte came from.
                         (_, _, d, v) if (matches!(d, V::Mix(_)) && op != AluOp::Mov) || matches!(v, V::Mix(_)) => match shuffle(wide, op, d, v) {
                             Some(r) => r,
+                            // Arithmetic on known discriminator bytes: a number from all of them.
+                            None if !has_data(d) && !has_data(v) && op != AluOp::Mov && known(d).is_some() && known(v).is_some() => {
+                                let ((a, ma), (b, mb)) = (known(d).unwrap(), known(v).unwrap());
+                                compute(self.p.version, wide, op, a, b).map_or(V::Unknown, |r| V::Disc(r, ma | mb))
+                            }
                             None => {
                                 if op != AluOp::Mov {
                                     self.consume(d);
@@ -755,7 +928,7 @@ impl Walk<'_> {
                             let (d, src, n) = (s.regs[1], s.regs[2], s.regs[3]);
                             self.memcpy(&mut s, d, src, n);
                         }
-                        CallTarget::Syscall("sol_memcmp_") => self.memcmp(&mut s),
+                        CallTarget::Syscall("sol_memcmp_") => self.memcmp(&mut s, i),
                         target => {
                             // A data value handed to a function or syscall is used.
                             for r in 1..=5 {
@@ -767,9 +940,14 @@ impl Walk<'_> {
                             }
                             if let CallTarget::Internal(t) = target {
                                 // A callee handed neither the data nor a stack address cannot reach either.
-                                if depth < MAX_DEPTH && s.regs[1..=5].iter().any(|v| matches!(v, V::Data(_) | V::Frame(..))) {
+                                // Discovering, a call handed the data past its first byte (and not its
+                                // start) is a decoder or handler reading arguments, not dispatch.
+                                let past_dispatch = self.tests.is_some()
+                                    && s.regs[1..=5].iter().any(|v| matches!(v, V::Data(k) if *k >= 1))
+                                    && !s.regs[1..=5].iter().any(|v| matches!(v, V::Data(0)));
+                                if depth < MAX_DEPTH && !past_dispatch && s.regs[1..=5].iter().any(|v| matches!(v, V::Data(_) | V::Frame(..))) {
                                     let t = *t;
-                                    let mut callee = State { regs: [V::Unknown; 11], mem: s.mem.clone() };
+                                    let mut callee = State { regs: [V::Unknown; 11], mem: s.mem.clone(), matched: s.matched };
                                     callee.regs[1..=5].copy_from_slice(&s.regs[1..=5]);
                                     let frame = self.next_frame;
                                     self.next_frame += 1;
@@ -791,6 +969,7 @@ impl Walk<'_> {
                                             self.escaped = true;
                                         }
                                         if let Some(ret) = ret {
+                                            s.matched = ret.matched;
                                             let before = std::mem::take(&mut s.mem);
                                             for (k, v) in ret.mem {
                                                 if k.0 == frame {
@@ -812,6 +991,10 @@ impl Walk<'_> {
                                     }
                                 }
                             }
+                            if self.sound_calls && !matches!(target, CallTarget::Syscall(n) if READ_ONLY_SYSCALLS.contains(n)) {
+                                let args = s.regs;
+                                clobber(&mut s, &args[1..=5]);
+                            }
                         }
                     }
                     for r in 0..=5 {
@@ -821,6 +1004,10 @@ impl Walk<'_> {
                 Op::Callx { .. } => {
                     if s.regs[1..=5].iter().any(|v| Self::reaches_data(&s, *v)) {
                         self.escaped = true;
+                    }
+                    if self.sound_calls {
+                        let args = s.regs;
+                        clobber(&mut s, &args[1..=5]);
                     }
                     for r in 1..=5 {
                         self.consume(s.regs[r]);
@@ -846,12 +1033,12 @@ impl Walk<'_> {
         let mut returned: Option<State> = None;
         let mut visits: HashMap<BlockId, u8> = HashMap::new();
         while let Some(b) = work.pop() {
-            if self.exhausted() {
+            if self.exhausted() || (self.stop_on_match && self.matched == 0xff) {
                 return None;
             }
             let blk = &self.cfg.blocks[b as usize];
             let start = first.take().unwrap_or(blk.start);
-            let out = self.block(at_entry[&b].clone(), start, blk.end, depth);
+            let mut out = self.block(at_entry[&b].clone(), start, blk.end, depth);
             if blk.term == Term::Return {
                 match returned.as_mut() {
                     None => returned = Some(out.clone()),
@@ -868,8 +1055,39 @@ impl Walk<'_> {
                 let (lhs, rhs) = (out.regs[dst as usize], Self::operand(&out, src));
                 self.consume(lhs);
                 self.consume(rhs);
-                if let (Some((a, ma)), Some((c, mc))) = (known(lhs), known(rhs)) {
+                // Discovering: a test of unknown discriminator bytes is recorded and only its not-equal
+                // side is followed. The equal side is the next walk's, with those bytes fixed, so a
+                // walk covers one level of the dispatch and never enters the handlers.
+                let mut test = Test::None;
+                if matches!(cond, Cond::Eq | Cond::Ne) {
+                    let (width, lane) = if wide { (u64::MAX, 8) } else { (u64::from(u32::MAX), 4) };
+                    if let (m @ V::Mix(_), V::Const(c)) | (V::Const(c), m @ V::Mix(_)) = (lhs, rhs) {
+                        test = self.record_test(m, c & width, lane, out.matched);
+                    }
+                }
+                if test == Test::OffPath {
+                    succs = Vec::new();
+                } else if test != Test::None {
+                    // A known byte that differs from the constant also leaves only the not-equal side.
+                    succs = vec![if cond == Cond::Eq { fall } else { taken }];
+                } else if let (Some((a, ma)), Some((c, mc))) = (known(lhs), known(rhs)) {
                     self.checked |= ma | mc;
+                    // An equality test that holds, under the comparison's width (a 32-bit one compares
+                    // at most 4 bytes). Ordered comparisons do not count: a binary search's pivots are
+                    // often a discriminator plus or minus one.
+                    let lane = if wide { 8 } else { 4 };
+                    let m = if self.exact_bytes { compared_bytes(lhs, lane) | compared_bytes(rhs, lane) } else { ma | mc };
+                    if m != 0 && matches!(cond, Cond::Eq | Cond::Ne) && holds(Cond::Eq, wide, a, c) && (wide || m.count_ones() <= 4) {
+                        if self.exact_bytes {
+                            out.matched |= m;
+                        } else {
+                            self.matched |= m;
+                        }
+                        if (out.matched == 0xff || self.matched == 0xff) && self.matched_at.is_none() {
+                            self.matched = 0xff;
+                            self.matched_at = Some(blk.end - 1);
+                        }
+                    }
                     succs = vec![if holds(cond, wide, a, c) { taken } else { fall }];
                 } else {
                     self.undecided += 1;
@@ -1256,6 +1474,82 @@ impl<'a> Finder<'a> {
         }
     }
 
+    /// 64-bit constants the code compares with the first 8 bytes of a buffer (a 64-bit load at
+    /// offset 0 from a pointer other than the stack), or with 8 bytes through `sol_memcmp_`, each
+    /// with the first place it is loaded. Instruction discriminators are among them, and so are
+    /// account type tags and anything else compared that way; [`unnamed`] tells them apart.
+    fn id_candidates(&self) -> BTreeMap<u64, u32> {
+        let mut out = BTreeMap::new();
+        let compared = |i: u32, reg: u8| {
+            let func = self.function_of(i)?;
+            let end = (i as usize + 12).min(self.p.insns.len());
+            for k in i as usize + 1..end {
+                let op = self.p.insns[k].op;
+                if let Op::Jcond { dst, src: Operand::Reg(src), .. } = op {
+                    let other = if dst == reg { src } else if src == reg { dst } else { continue };
+                    let d = self.def(func, k as u32, other)?;
+                    return matches!(self.p.insns[d as usize].op, Op::Load { w: Width::DW, src: base, off: 0, .. } if base != 10).then_some(());
+                }
+                if Self::writes(&op, reg) {
+                    return None;
+                }
+            }
+            None
+        };
+        for (i, x) in self.p.insns.iter().enumerate() {
+            let i = i as u32;
+            match x.op {
+                Op::Lddw { dst, .. } => {
+                    let Some(v) = self.p.lddw_value(i) else { continue };
+                    if compared(i, dst).is_some() {
+                        out.entry(v).or_insert(i);
+                    } else if let Some(c) = self.memcmp_operand(i, dst, v) {
+                        out.entry(c).or_insert(i);
+                    }
+                }
+                // sBPF v2: mov32 low half, then hor64 high half.
+                Op::Alu { op: AluOp::Hor, dst, src: Operand::Imm(hi), .. } => {
+                    let lo = (i.saturating_sub(4)..i).rev().find_map(|j| match self.p.insns[j as usize].op {
+                        Op::Alu { op: AluOp::Mov, wide: false, dst: d, src: Operand::Imm(lo) } if d == dst => Some(lo as u32),
+                        _ => None,
+                    });
+                    if let Some(lo) = lo {
+                        if compared(i, dst).is_some() {
+                            out.entry(u64::from(lo) | (u64::from(hi as u32) << 32)).or_insert(i);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if out.len() >= MAX_ID_CANDIDATES {
+                break;
+            }
+        }
+        out
+    }
+
+    /// The 8 bytes at read-only address `addr`, loaded into `reg` at `i`, when a `sol_memcmp_` of
+    /// 8 bytes follows that takes them.
+    fn memcmp_operand(&self, i: u32, reg: u8, addr: u64) -> Option<u64> {
+        let bytes = self.p.read(addr, 8)?;
+        let end = (i as usize + 16).min(self.p.insns.len());
+        let call = (i as usize + 1..end).find(|&k| matches!(self.p.insns[k].op, Op::Call { .. }))? as u32;
+        if *self.p.call_target(call) != CallTarget::Syscall("sol_memcmp_") {
+            return None;
+        }
+        let func = self.function_of(i)?;
+        let len = self.def(func, call, 3)?;
+        if !matches!(self.p.insns[len as usize].op, Op::Alu { op: AluOp::Mov, src: Operand::Imm(8), .. }) {
+            return None;
+        }
+        let takes = (1..=2u8).any(|r| {
+            self.def(func, call, r).is_some_and(|d| {
+                d == i || matches!(self.p.insns[d as usize].op, Op::Alu { op: AluOp::Mov, src: Operand::Reg(s), .. } if s == reg)
+            })
+        });
+        takes.then(|| u64::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
     /// The jump at file offset `chain` (the byte-chain evidence) as an instruction index, walked back
     /// to the first byte compare of its run.
     fn chain_head(&self, chain_file_offset: u32) -> Option<u32> {
@@ -1266,7 +1560,9 @@ impl<'a> Finder<'a> {
 
 /// Argument layouts for the instructions in `discriminators` (name -> the 8 bytes as a little-endian
 /// u64, and the instructions that load its `Instruction: <Name>` log string). `chains` finds
-/// byte-wise dispatch. Returns the layouts, and whether the program-wide budget ran out.
+/// byte-wise dispatch. When no start near the dispatch works, `entries` (where the entrypoint
+/// holds the data, for instructions [`unnamed`] proved) are tried before guessing. Returns the
+/// layouts, and whether the program-wide budget ran out.
 ///
 /// A layout is `complete` only when the walk reached the instruction's log string with the
 /// argument bytes still reachable, and nothing it does not follow received them.
@@ -1275,6 +1571,7 @@ pub fn recover(
     cfg: &Cfg,
     chains: &ByteCompares,
     discriminators: &BTreeMap<String, (u64, Vec<u32>)>,
+    entries: &[crate::emu::Handover],
 ) -> (BTreeMap<String, ArgumentLayout>, bool) {
     let finder = Finder::new(p, cfg);
     let mut out = BTreeMap::new();
@@ -1302,9 +1599,16 @@ pub fn recover(
                 p,
                 cfg,
                 disc: d,
+                known_bytes: 0xff,
+                tests: None,
                 reads: BTreeSet::new(),
                 copies: Vec::new(),
                 checked: 0,
+                matched: 0,
+                matched_at: None,
+                stop_on_match: false,
+                sound_calls: false,
+                exact_bytes: false,
                 undecided: 0,
                 steps: 0,
                 budget: WALK_BUDGET.min(PROGRAM_BUDGET - spent),
@@ -1313,7 +1617,7 @@ pub fn recover(
                 log_sites,
                 reached_handler: false,
             };
-            let mut st = State { regs: [V::Unknown; 11], mem: BTreeMap::new() };
+            let mut st = State { regs: [V::Unknown; 11], mem: BTreeMap::new(), matched: 0 };
             st.regs[start.reg as usize] = V::Data(-start.delta);
             st.regs[10] = V::Frame(0, 0);
             let Some(&b) = cfg.block_of.get(start.at as usize) else { continue };
@@ -1327,6 +1631,45 @@ pub fn recover(
             let score = (fields.len(), walk.steps);
             if best.as_ref().is_none_or(|(r, s, _, _)| score > (*r, *s)) {
                 best = Some((score.0, score.1, walk, start));
+            }
+        }
+        for h in entries {
+            if best.is_some() {
+                break;
+            }
+            let (Some(f), Some(&b)) = (cfg.functions.get(&h.func), cfg.block_of.get(h.at as usize)) else { continue };
+            if spent >= PROGRAM_BUDGET {
+                exhausted = true;
+                break;
+            }
+            let mut walk = Walk {
+                p,
+                cfg,
+                disc: d,
+                known_bytes: 0xff,
+                tests: None,
+                reads: BTreeSet::new(),
+                copies: Vec::new(),
+                checked: 0,
+                matched: 0,
+                matched_at: None,
+                stop_on_match: false,
+                sound_calls: false,
+                exact_bytes: false,
+                undecided: 0,
+                steps: 0,
+                budget: WALK_BUDGET.min(PROGRAM_BUDGET - spent),
+                next_frame: 1,
+                escaped: false,
+                log_sites,
+                reached_handler: false,
+            };
+            let _ = walk.region(b, h.at, handover_state(h), &f.blocks, 0);
+            spent += walk.steps;
+            if walk.checked == 0xff {
+                let site = walk.matched_at.unwrap_or(h.at);
+                let fields = walk.fields();
+                best = Some((fields.len(), walk.steps, walk, Start { func: h.func, at: h.at, reg: 0, delta: 0, site }));
             }
         }
         // When no traced start works, start at the entry of each function that tests the discriminator
@@ -1350,9 +1693,16 @@ pub fn recover(
                         p,
                         cfg,
                         disc: d,
+                        known_bytes: 0xff,
+                        tests: None,
                         reads: BTreeSet::new(),
                         copies: Vec::new(),
                         checked: 0,
+                        matched: 0,
+                        matched_at: None,
+                        stop_on_match: false,
+                        sound_calls: false,
+                        exact_bytes: false,
                         undecided: 0,
                         steps: 0,
                         budget: GUESS_BUDGET.min(PROGRAM_BUDGET - spent),
@@ -1361,7 +1711,7 @@ pub fn recover(
                         log_sites,
                         reached_handler: false,
                     };
-                    let mut st = State { regs: [V::Unknown; 11], mem: BTreeMap::new() };
+                    let mut st = State { regs: [V::Unknown; 11], mem: BTreeMap::new(), matched: 0 };
                     st.regs[10] = V::Frame(0, 0);
                     match guess {
                         Guess::Reg(r) => st.regs[r as usize] = V::Data(0),
@@ -1406,13 +1756,196 @@ pub fn recover(
     (out, exhausted)
 }
 
+/// What an equality test of discriminator bytes told discovery.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Test {
+    /// Not a test of unknown discriminator bytes against a number.
+    None,
+    /// Recorded: the bytes it covers may equal the number.
+    Recorded,
+    /// A known byte already differs from the number.
+    Unequal,
+    /// On a path where the known bytes did not all match: not followed.
+    OffPath,
+}
+
+/// Syscalls that write nothing on the caller's stack.
+const READ_ONLY_SYSCALLS: &[&str] = &[
+    "abort",
+    "sol_panic_",
+    "sol_log_",
+    "sol_log_64_",
+    "sol_log_pubkey",
+    "sol_log_compute_units_",
+    "sol_log_data",
+    "sol_set_return_data",
+    "sol_invoke_signed_c",
+    "sol_invoke_signed_rust",
+];
+
+/// Forget the stack slots a call may have written: at or above each stack address among `args`,
+/// in that address's frame.
+fn clobber(s: &mut State, args: &[V]) {
+    for v in args {
+        if let V::Frame(f, o) = *v {
+            s.mem.retain(|(ff, oo), _| *ff != f || *oo + 8 <= o);
+        }
+    }
+}
+
+/// Whether 8 bytes can be an identifier rather than a number: at most two of them are 0x00 or
+/// 0xff, which hashes and ASCII tags satisfy and amounts, limits and masks do not.
+fn looks_like_id(v: u64) -> bool {
+    v.to_le_bytes().iter().filter(|&&b| b == 0 || b == 0xff).count() <= 2
+}
+
+/// The walk state at a handover: the data pointer where the entrypoint holds it, nothing else known.
+fn handover_state(h: &crate::emu::Handover) -> State {
+    let mut st = State { regs: [V::Unknown; 11], mem: BTreeMap::new(), matched: 0 };
+    st.regs[10] = V::Frame(0, 0);
+    for &(r, k) in &h.regs {
+        st.regs[r as usize] = V::Data(k);
+    }
+    for &(o, k) in &h.slots {
+        if o % 8 == 0 {
+            st.mem.insert((0, o), Slot::Whole(V::Data(k)));
+        }
+    }
+    for &(r, o) in &h.frame_regs {
+        st.regs[r as usize] = V::Frame(0, o);
+    }
+    for &(o, f) in &h.frame_slots {
+        if o % 8 == 0 {
+            st.mem.insert((0, o), Slot::Whole(V::Frame(0, f)));
+        }
+    }
+    st
+}
+
+/// Instruction discriminators found without a name: values the program tests the first 8 bytes of
+/// its instruction data against, as its own entrypoint delivers the data (`hs`, nearest the
+/// dispatch first).
+///
+/// Discovery walks from each handover with those bytes unknown and records every equality test of
+/// them against a constant, following only the not-equal side; fixing the bytes a test covers and
+/// walking again goes one level down a byte-wise decision tree. Every value found that way, and
+/// every 64-bit constant compared with the first 8 bytes of any buffer, is then tried as the data's
+/// first 8 bytes. It counts only when, on one path, equality tests find all 8 bytes equal to what
+/// they test them against: bytes keep their positions through shifts and masks, so a test of one
+/// byte proves one byte, and a call the walk does not follow is assumed to overwrite the stack it
+/// is handed. A constant compared with an account's data never meets that. Returns the
+/// discriminators (as little-endian u64s) with the comparison where the last byte matched, and
+/// whether a budget ran out.
+pub fn unnamed(p: &Program, cfg: &Cfg, hs: &[crate::emu::Handover], known: &BTreeSet<u64>) -> (Vec<(u64, u32)>, bool) {
+    let finder = Finder::new(p, cfg);
+    let starts: Vec<(&[BlockId], BlockId, u32, State)> = hs
+        .iter()
+        .filter_map(|h| Some((cfg.functions.get(&h.func)?.blocks.as_slice(), *cfg.block_of.get(h.at as usize)?, h.at, handover_state(h))))
+        .collect();
+    if starts.is_empty() {
+        return (Vec::new(), false);
+    }
+    let walk_from = |s: usize, disc: [u8; 8], known_bytes: u8, tests: bool, budget: usize| {
+        let (blocks, b, at, st) = &starts[s];
+        let mut walk = Walk {
+            p,
+            cfg,
+            disc,
+            known_bytes,
+            tests: tests.then(BTreeSet::new),
+            reads: BTreeSet::new(),
+            copies: Vec::new(),
+            checked: 0,
+            matched: 0,
+            matched_at: None,
+            stop_on_match: !tests,
+            sound_calls: true,
+            exact_bytes: true,
+            undecided: 0,
+            steps: 0,
+            budget,
+            next_frame: 1,
+            escaped: false,
+            log_sites: &[],
+            reached_handler: false,
+        };
+        let _ = walk.region(*b, *at, st.clone(), blocks, 0);
+        walk
+    };
+    let mut spent = 0usize;
+    let mut exhausted = false;
+    // Each candidate with the starts to try it from: the constants from the start nearest the
+    // dispatch, what discovery finds from the start it was found from.
+    let mut candidates: BTreeMap<u64, (u32, Vec<usize>)> = finder.id_candidates().into_iter().map(|(v, site)| (v, (site, vec![0]))).collect();
+    for s in 0..starts.len() {
+        let mut queue: Vec<([u8; 8], u8)> = vec![([0; 8], 0)];
+        let mut seen: BTreeSet<([u8; 8], u8)> = BTreeSet::new();
+        let mut walks = 0usize;
+        while let Some((bytes, mask)) = queue.pop() {
+            if spent >= DISCOVERY_BUDGET || walks >= MAX_DISCOVERY_WALKS {
+                exhausted = true;
+                break;
+            }
+            walks += 1;
+            let walk = walk_from(s, bytes, mask, true, DISCOVERY_WALK_BUDGET.min(DISCOVERY_BUDGET - spent));
+            spent += walk.steps;
+            // A walk below the first level that runs out has gone past the dispatch into code that
+            // reads arguments (a handler, in a program whose tag is shorter than 8 bytes), so its
+            // tests are not followed further down.
+            let descend = mask == 0 || !walk.exhausted();
+            for (k, n, v) in walk.tests.unwrap_or_default() {
+                let mut next = bytes;
+                let mut next_mask = mask;
+                let mut consistent = true;
+                for i in 0..n as usize {
+                    let (at, byte) = (k as usize + i, (v >> (8 * i)) as u8);
+                    if mask & (1 << at) != 0 {
+                        consistent &= bytes[at] == byte;
+                    }
+                    next[at] = byte;
+                    next_mask |= 1 << at;
+                }
+                if !consistent || next_mask == mask {
+                    continue;
+                }
+                if next_mask == 0xff {
+                    let (_, from) = candidates.entry(u64::from_le_bytes(next)).or_insert((starts[s].2, Vec::new()));
+                    if !from.contains(&s) {
+                        from.push(s);
+                    }
+                } else if descend && seen.insert((next, next_mask)) {
+                    queue.push((next, next_mask));
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    'candidates: for (value, (site, from)) in candidates {
+        if known.contains(&value) || !looks_like_id(value) {
+            continue;
+        }
+        for s in from {
+            if spent >= UNNAMED_BUDGET {
+                return (out, true);
+            }
+            let walk = walk_from(s, value.to_le_bytes(), 0xff, false, WALK_BUDGET.min(UNNAMED_BUDGET - spent));
+            spent += walk.steps;
+            if walk.matched == 0xff {
+                out.push((value, walk.matched_at.unwrap_or(site)));
+                continue 'candidates;
+            }
+        }
+    }
+    (out, exhausted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn stack_bytes_keep_their_discriminator_provenance() {
-        let mut s = State { regs: [V::Unknown; 11], mem: BTreeMap::new() };
+        let mut s = State { regs: [V::Unknown; 11], mem: BTreeMap::new(), matched: 0 };
         // The 8 discriminator bytes stored whole, then read back one byte at a time.
         s.store(0, -8, 8, V::Disc(0x0807_0605_0403_0201, 0xff));
         assert_eq!(s.load(0, -6, 1), V::Disc(0x03, 1 << 2));

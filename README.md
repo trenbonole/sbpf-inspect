@@ -4,13 +4,15 @@ Offline interface recovery for Solana sBPF programs. Give it a compiled program
 (a `.so` file, or a dump of a deployed program) and it reports what the binary
 contains, which Anchor instructions, accounts and events it implements, each
 instruction's ordered account list with writable and signer flags, and the byte
-layout of each instruction's arguments. For native programs it finds the
-instruction dispatch. Every name comes with the byte offsets of the evidence
-behind it.
+layout of each instruction's arguments. Instructions whose names are not in the
+binary are found by their 8-byte discriminators, and for native programs it
+finds the instruction dispatch. Every name comes with the byte offsets of the
+evidence behind it.
 
-It runs as a Rust library, a command-line tool, or a 423 KB WebAssembly module
-for Node, with no third-party analysis code. It never executes the program and
-never touches the network.
+It runs as a Rust library, a command-line tool, or a WebAssembly module for
+Node, with no third-party analysis code. It never touches the network. The only
+code of the program it runs is the entrypoint's decoding of a made-up input, in
+its own interpreter, to find where the instruction data goes.
 
 ## Results on real programs
 
@@ -71,7 +73,7 @@ every account name, the order and both flags match the IDL.
 | Zeta, `ZETAxsqBRek56DhiGXrn75yj2NHU3aYUnxvHXpkf3aD` | 102 of 107 | 85 of 100 | 51 of 76 |
 | marginfi v2, `MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA` | 87 of 91 | 75 of 87 | 32 of 43 |
 | Jupiter Perpetuals, `PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu` | 59 of 59 | 52 of 59 | 25 of 33 |
-| Drift Vaults, `vAuLTsyrvSfZRuRB3XgvkPwNGgYSs9YRYymVebLKoxR` | 38 of 46 | 38 of 38 | 16 of 17 |
+| Drift Vaults, `vAuLTsyrvSfZRuRB3XgvkPwNGgYSs9YRYymVebLKoxR` | 46 of 46 | 46 of 46 | 23 of 24 |
 | Raydium LaunchLab, `LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj` | 28 of 28 | 26 of 28 | 13 of 13 |
 | Meteora Alpha Vault, `vaU6kP7iNEGkbmPkLmZfGwiGxd4Mob24QQCie5R9kd2` | 27 of 27 | 27 of 27 | 14 of 17 |
 | Kamino Farms, `FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr` | 27 of 27 | 26 of 27 | 13 of 13 |
@@ -87,15 +89,19 @@ every account name, the order and both flags match the IDL.
 | Metaplex Candy Machine Core, `CMACYFENjoBMHzapRXyo1JZkVS6EtaDDzkjMrmQLvr4J` | 8 of 8 | 8 of 8 | 3 of 4 |
 | Jupiter Limit Order v2, `j1o2qRpjcyUwEvwtcfhEQefh773ZgjxcVRry7LDqg5X` | 8 of 8 | 8 of 8 | 6 of 6 |
 | Lifinity v2, `2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c` | 3 of 3 | 3 of 3 | 3 of 3 |
-| **Total** | **652 of 677** | **567 of 650 (87%)** | **326 of 390 (84%)** |
+| **Total** | **660 of 677** | **575 of 658 (87%)** | **333 of 397 (84%)** |
 
-On the 5,385 accounts compared, the writable flag agrees with the IDL on 5,373
-and the signer flag on 5,368. The tool marked an account writable where the IDL
+On the 5,464 accounts compared, the writable flag agrees with the IDL on 5,452
+and the signer flag on 5,447. The tool marked an account writable where the IDL
 did not three times, and each time the IDL is out of date: marginfi's source
 declares that account `mut`, and Zeta's binary raises ConstraintMut naming the
 account. It never marked an account signer where the IDL did not. The argument
 column is different: the argument walk was developed on these programs, so it
-is not an unseen measurement (see [Argument layouts](#argument-layouts)).
+is not an unseen measurement (see [Argument layouts](#argument-layouts)). Drift
+Vaults' row counts eight instructions earlier versions marked `referenced`; the
+search for unnamed instructions shows the program dispatches them (see
+[Instructions without names](#instructions-without-names)), and their account
+lists, already recovered, are all exact.
 
 Published IDLs often lag the deployed program, so they are an imperfect answer
 key. The tool also named 133 implemented instructions these IDLs do not list
@@ -116,18 +122,18 @@ matches, a 16- or 32-byte value read in 8-byte parts counting as one. Precision
 counts, of the layouts that report fields, those that put every field edge where
 the IDL has one.
 
-The walk was developed on the 20 programs above and the four programs at the
-top. The nine programs the account-list method was developed on were graded at
+The walk was developed on the 20 programs above, the three programs at the top
+that have IDLs, and one private program the figures here leave out. The nine programs the account-list method was developed on were graded at
 the end without changes. Then 13 more Anchor programs were fetched and graded
 once (Kamino Liquidity and Scope, Tensor Swap and Whitelist, Squads v3, Jupiter
 v4, Switchboard v2 and On-Demand, GooseFX SSL v2, Meteora Stake-for-Fee, Jupiter
 Locker, and two governance programs). That run found three gaps, two of which
 were then fixed; both runs are shown.
 
-| | Development (24 programs) | Nine graded at the end | 13 new, first run | 13 new, after the fixes |
+| | Development (23 programs) | Nine graded at the end | 13 new, first run | 13 new, after the fixes |
 |---|---|---|---|---|
-| Layouts exact | 379 of 455 (83%) | 201 of 227 (89%) | 65 of 111 (59%) | 71 of 111 (64%) |
-| Precision | 401 of 435 (92%) | 215 of 223 (96%) | 71 of 74 (96%) | 77 of 86 (90%) |
+| Layouts exact | 383 of 457 (84%) | 201 of 227 (89%) | 65 of 111 (59%) | 72 of 112 (64%) |
+| Precision | 405 of 437 (93%) | 215 of 223 (96%) | 71 of 74 (96%) | 78 of 87 (90%) |
 | Instructions with arguments and no layout | 0 | 0 | 35 | 21 |
 
 The gaps were byte-wise dispatch that extracts each byte from a wider load
@@ -138,12 +144,12 @@ Jupiter v4 fully and Squads v3 too, though Squads v3's public keys come back in
 pieces, which is why precision falls. Switchboard On-Demand compares in a loop
 the walk does not unroll, so 21 of its instructions get no layout.
 
-The `irregular` flag is the precision signal. Across all four sets, 590 of the
-598 layouts not marked irregular are boundary-correct (98.7%), against 103 of
-147 marked irregular. Nearly all of those are public keys and other byte arrays
+The `irregular` flag is the precision signal. Across all four sets, 595 of the
+602 layouts not marked irregular are boundary-correct (98.8%), against 103 of
+146 marked irregular. Nearly all of those are public keys and other byte arrays
 the compiler moves in uneven pieces (4, 2, 8, 1, ...) that then reach a
 comparison and show up as fields. An empty layout marked `complete: true`
-means no arguments 188 times out of 192; an empty layout without it can still
+means no arguments 184 times out of 188; an empty layout without it can still
 hide arguments.
 
 Older Anchor versions dispatch byte by byte, and a walk that starts at the
@@ -152,10 +158,52 @@ discriminator comparison loses the data pointer they set up before it. On the
 instructions. Starting where the data pointer comes from, and following
 deserializers that advance a `&mut &[u8]` cursor, is most of the difference.
 
-On the 13 new programs the account lists were also measured unchanged: 200 of
-214 exact, with the writable and signer flags each right on 1,852 of 1,853
-accounts. Tensor Swap and Switchboard v2 log no instruction names, so only 6 of
-46 and 1 of 54 of their instructions are named.
+On the 13 new programs the account lists were also measured unchanged: 202 of
+216 exact, with the writable and signer flags each right on 1,883 of 1,884
+accounts (two of those instructions count since the search for unnamed
+instructions corrected their status). Only 6 of Tensor Swap's 46 IDL
+instructions and 1 of Switchboard v2's 54 are named because the deployed
+programs implement no others (see
+[Instructions without names](#instructions-without-names)).
+
+### Instructions without names
+
+The search for unnamed instructions (see [How it works](#instructions-without-names-1))
+was checked on the 45 Anchor programs above that have IDLs. To measure what it
+finds on its own, it was also run without skipping the instructions the logs
+already name: it found all 1,524 instructions the programs name in their logs,
+and the one value it reported that is neither in an IDL nor named by a log is a
+real instruction (below).
+
+In normal use it adds what the names miss:
+
+- **Proven dispatch corrects 10 instructions earlier versions marked
+  `referenced`.** Drift Vaults implements eight instructions with the same names
+  as Drift instructions it calls (`deposit`, `add_insurance_fund_stake`, ...),
+  so their discriminators were first seen stored for those calls; the search
+  shows the program's own dispatch tests them. The same holds for one
+  instruction each in Meteora Stake-for-Fee and the Locked Voter.
+- **Instructions no string names.** Meteora Stake-for-Fee dispatches an
+  instruction its IDL lacks, `5e6506ffe3bf6002`: its code compares all 8 bytes,
+  one at a time, and calls a handler that reads no arguments. Token-2022's
+  interface instructions and a transfer hook's are covered below.
+- **Deployments smaller than their IDLs.** Drift's dispatch tests 3 values and
+  answers anything else with Anchor's InstructionFallbackNotFound: the deployed
+  program implements three withdrawal instructions (`withdraw_from_spot_market`,
+  `withdraw_from_insurance_fund`, `withdraw_native_sol`) and none of the 241
+  its IDL lists. Tensor Swap's dispatch tests 7 values (6 of its IDL's 46
+  instructions and one it lacks) and Switchboard v2's 2 (1 of 54). Their IDLs
+  are stale; earlier versions of this README blamed missing log strings.
+
+On a closed-source native program on mainnet that selects instructions by 8-byte
+ASCII tags, it finds both tags, and the layout it gives the one the program is
+called with matches its recent calls field for field. On a Token-2022 transfer
+hook that compares its 8-byte discriminators byte by byte in no fixed order, it
+finds all six: the interface's `execute`, whose argument is the u64 amount, and
+five of the program's own that no string names.
+
+The cost is 11% more time over the 60 programs measured (368 to 410 seconds),
+most of it in a few large programs; see [Limits](#limits).
 
 ### Native programs
 
@@ -166,6 +214,14 @@ handler's own log (0 `InitializeMint`, 3 `Transfer`, ...; the others are
 extension families whose logs sit in sub-dispatchers), and the Address Lookup
 Table program 5 tags with 4 named. p-token and the Associated Token Account
 program log nothing, so their switches are reported unconfirmed.
+
+Token-2022 also implements the SPL token-metadata and token-group interfaces,
+whose instructions start with 8-byte discriminators. Earlier versions named 4
+of the 9 from log strings; the interfaces' published hash inputs name all 9, and
+the search for unnamed instructions confirms they are dispatched. Their layouts
+match the interface definitions: `emitter` (Emit) is an option tag, a u64, an
+option tag and a u64; `initialize_token_group` a 32-byte authority and a u64;
+`updating_field` a field tag and the length of a string.
 
 pump.fun was measured 2026-10-08 on program data dumped near mainnet slot
 454,696,749 (SHA-256 of the dumps: `a4b32d32…9f16` and `a8d05e69…697e`); the
@@ -206,10 +262,16 @@ binary, which is rare. See [Limits](#limits).
 - each instruction's argument layout: field offsets and sizes after the
   discriminator, whether a field was only copied, and whether the walk saw
   everywhere the data went
-- names under the SPL interface namespaces Anchor programs implement (transfer
-  hook, token metadata, token group), which do not count as Anchor detection
+- names under the SPL interface namespaces (transfer hook, token metadata, token
+  group), from log strings or from the interfaces' published hash inputs, some
+  of which differ from the instruction's name (`updating_field` for
+  UpdateField). They do not count as Anchor detection
 - for native programs, the instruction dispatch: tag values, handler offsets,
   and handler names from their logs
+- instructions found by their 8-byte discriminator alone, when the binary does
+  not hold their names: Anchor instructions that are not logged, and native
+  programs' own 8-byte tags, shown as text when they are ASCII. Each comes with
+  its argument layout and the comparison that matched it
 - Anchor's own IDL-management instructions, reported as framework instructions
 - account and event types, with discriminator and evidence
 - whether the program is Anchor, from the markers that say so, including the tag
@@ -311,6 +373,44 @@ tests the discriminator, guessing the data pointer among the argument registers
 and the caller's stack arguments; deciding all 8 bytes is what confirms a
 guess.
 
+### Instructions without names
+
+A discriminator is named only through a name in the binary. Instructions the
+program does not log, and native programs that select instructions by their own
+8-byte tags, are found from the code instead, and reported under
+`unnamed_instructions` only when the program's own code proves them.
+
+1. **Run the entrypoint.** A small interpreter runs the program's entrypoint on
+   a made-up input with no accounts and 1,024 bytes of instruction data, until
+   the entry function holds a pointer into that data. It records two places:
+   the first call the entry function hands the data to (to a register the callee
+   reads, in the stack arguments, or in a struct it is given a pointer to), and
+   the first place it holds the pointer at all, when that is earlier. This works
+   whatever decodes the input (solana-program's `deserialize`, Pinocchio, Anchor)
+   because the program does the decoding itself.
+2. **Discover.** From each place, a walk runs with the first 8 data bytes
+   unknown and records every equality test of them against a constant: one
+   64-bit comparison, one byte at a time, or `sol_memcmp_`. It follows only the
+   not-equal side, so it stays in the dispatch. Fixing the bytes a test covers
+   and walking again goes one level down a byte-by-byte decision tree. Below the
+   first level a test counts only on a path where every byte fixed so far was
+   found equal: elsewhere the code is reading arguments, not choosing an
+   instruction.
+3. **Prove.** Every value found, and every 64-bit constant the code compares
+   with the first 8 bytes of any buffer, is tried as the start of the data on a
+   walk from the same place. It counts only when, on one path, equality tests
+   find all 8 bytes equal to what they test them against. Bytes keep their
+   positions through shifts and masks, so a test of one byte proves one byte; a
+   binary search's ordered comparisons prove nothing; and a call the walk does
+   not follow is assumed to overwrite the stack it is handed, so a stale pointer
+   cannot stand in for an account's data.
+
+A proven value that matches an instruction marked `referenced` (its
+discriminator was first seen stored, as when building a call to another
+program) marks that instruction `implemented`. The others get an argument
+layout as named instructions do, starting from the entrypoint when no start near
+the dispatch works.
+
 ## Usage
 
 **Command line**
@@ -339,6 +439,18 @@ for (const ix of report.anchor.instructions) {
 ```
 
 `inspect` throws on input that is not a parsable sBPF ELF.
+
+**WebAssembly with no imports**, for a sandbox that instantiates the module with
+an empty import object:
+
+```sh
+cargo build --release --target wasm32-unknown-unknown --lib --no-default-features
+```
+
+The module exports `sbpf_inspect_alloc(len)`, which returns a buffer to copy the
+program into, and `sbpf_inspect_run(ptr, len)`, which returns where the JSON
+result is as `(ptr << 32) | len`: `{"ok": <report>}`, or `{"error": "..."}` for
+input that is not an sBPF program.
 
 **Rust**
 
@@ -386,7 +498,15 @@ Abridged report for the Anchor test program in `fixtures/anchor-demo`:
 ```
 
 `initialize` takes `fee_bps: u16`, so its arguments are 2 bytes at offset 0. A
-native program's report carries `native_dispatch` instead.
+native program's report carries `native_dispatch` instead. Instructions found
+without names are listed under `unnamed_instructions`, here for the small native
+program the unit tests build, which selects instructions by 8-byte ASCII tags:
+
+```json
+"unnamed_instructions": [
+  { "discriminator": "5441474f4e453031", "text": "TAGONE01", "match_offset": 168, "arguments": { "fields": [{ "offset": 0, "size": 8 }], "fixed_size": 8, "irregular": false, "complete": true, "dispatch_offset": 144, "truncated": false } }
+]
+```
 
 All offsets are byte offsets into the input file. Evidence kinds are
 `lddw_immediate`, `mov32_hor64_immediate`, `byte_compare_chain`, `data_bytes`
@@ -395,10 +515,17 @@ and `string`.
 ## Limits
 
 - Instruction names come from Anchor's `Instruction: <Name>` log strings.
-  Programs built without those logs and other frameworks yield no instruction
-  names, account lists or argument layouts. Drift logs only 3 of its instruction
-  names, so only those 3 are recovered. For native programs only the dispatch's
-  tags are found, named when their handlers log names.
+  Instructions without a name in the binary get no name and no account list,
+  only their discriminator and argument layout. For native programs with
+  one-byte tags only the dispatch's tags are found, named when their handlers
+  log names.
+- Instructions without names are found only when the entrypoint can be run to
+  the instruction data on an input without accounts, and the dispatch tests all
+  8 bytes for equality within four call levels of it. Dispatch that compares in
+  a loop, or reads the data only after checking accounts, is missed. The search
+  is slow on large native programs whose tag dispatch leads straight into
+  argument decoding: Token-2022 takes about 9 seconds natively and 12 as
+  WebAssembly.
 - A discriminator counts as found only as a 64-bit immediate, as bytes in a data
   section, or, for instructions, as a byte-by-byte comparison chain. Other code
   shapes, such as two 32-bit comparisons, are missed.
@@ -418,11 +545,11 @@ and `string`.
   not placed. A public key or other byte array that the compiler moves in uneven
   pieces and then compares can come back as several fields; such layouts are
   usually marked `irregular`. An empty layout means no arguments only when it is
-  marked `complete`, and even then 4 of 192 such claims in the tests were wrong.
+  marked `complete`, and even then 4 of 188 such claims in the tests were wrong.
 - Dispatch that compares the discriminator inside a loop the walk would have to
   unroll, as Switchboard On-Demand's does, gives no layouts.
 - Argument walks favour precision over speed: a 400,000-instruction program such
-  as Mango v4 takes about 19 seconds natively and 26 as WebAssembly; small
+  as Mango v4 takes about 26 seconds natively and 34 as WebAssembly; small
   programs take well under a second.
 - Tested on mainnet sBPF v0 and v3 binaries. The `mov32` + `hor64` immediate
   shape used by sBPF v2 compilers is covered by unit tests only.
